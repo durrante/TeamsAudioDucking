@@ -1,0 +1,34 @@
+<Window x:Class="TeamsAudioDucking.UI.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Teams Audio Ducking - Settings"
+        Width="480" SizeToContent="Height"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        ShowInTaskbar="True">
+    <StackPanel Margin="14">
+        <TextBlock x:Name="StatusText" FontWeight="SemiBold" Margin="0,0,0,10" Text="Status"/>
+
+        <CheckBox x:Name="ChkEnabled" Content="Enable automatic muting during Teams calls" Margin="0,2"/>
+        <CheckBox x:Name="ChkStartup" Content="Start with Windows (current user, no admin needed)" Margin="0,2"/>
+        <CheckBox x:Name="ChkSystemSounds" Content="Also mute Windows system sounds during calls" Margin="0,2"/>
+
+        <TextBlock Text="Never mute these processes (one per line, e.g. spotify):" Margin="0,10,0,2"/>
+        <TextBox x:Name="TxtExcluded" Height="70" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"/>
+
+        <TextBlock Text="Always mute these processes during calls (overrides the list above):" Margin="0,10,0,2"/>
+        <TextBox x:Name="TxtAlwaysMute" Height="70" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"/>
+
+        <TextBlock Text="Microsoft Teams itself is always exempt and is never muted by this tool."
+                   FontStyle="Italic" Foreground="Gray" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+        <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+            <Button x:Name="BtnMuteNow" Content="Mute other apps now" Padding="10,4" Margin="0,0,8,0" Click="BtnMuteNow_Click"/>
+            <Button x:Name="BtnRestoreNow" Content="Restore audio now" Padding="10,4" Click="BtnRestoreNow_Click"/>
+        </StackPanel>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button x:Name="BtnSave" Content="Save" Width="80" Margin="0,0,8,0" Click="BtnSave_Click" IsDefault="True"/>
+            <Button x:Name="BtnClose" Content="Close" Width="80" Click="BtnClose_Click" IsCancel="True"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
