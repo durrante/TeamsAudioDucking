@@ -61,6 +61,13 @@ About (version info). Double-click opens Settings.
 2. Run it. No admin prompt: it installs for your user only and adds a
    Start-menu shortcut, with an optional "start at sign-in" tick.
 
+> ⚠️ **Windows SmartScreen may show "Windows protected your PC"** the first
+> time you run the setup (or the portable exe). That is expected: the
+> installer is not code-signed, so Windows has no reputation data for it.
+> Click **More info**, then **Run anyway**. If you would rather not take my
+> word for it, the full source is in this repository and you can build it
+> yourself.
+
 That's it. The tray icon appears and it starts watching for Teams calls.
 
 Prefer no installer? Grab the portable zip from the same Releases page,
@@ -131,6 +138,15 @@ Everything runs locally. The utility never connects to the internet, never
 reads call contents, audio or credentials, and never records anything. It
 only reads Windows' own "which app is using the microphone" registry key and
 controls per-app volume/mute through the Windows Core Audio API.
+
+## Licence
+
+[MIT](LICENSE): free to use, copy, modify and share, at home or at work.
+
+Provided **as-is, without warranty of any kind**. It is a small tool that
+changes per-app audio state; it has been written carefully (exact state
+restore, crash recovery), but you use it at your own risk and nobody is
+liable if it misbehaves.
 
 ## Files it keeps
 
