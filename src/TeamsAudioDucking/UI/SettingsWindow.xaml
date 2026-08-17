@@ -11,6 +11,7 @@
         <CheckBox x:Name="ChkEnabled" Content="Enable automatic muting during Teams calls" Margin="0,2"/>
         <CheckBox x:Name="ChkStartup" Content="Start with Windows (current user, no admin needed)" Margin="0,2"/>
         <CheckBox x:Name="ChkSystemSounds" Content="Also mute Windows system sounds during calls" Margin="0,2"/>
+        <CheckBox x:Name="ChkRinging" Content="Start muting while a Teams call is ringing (experimental)" Margin="0,2"/>
 
         <TextBlock Text="Never mute these processes (one per line, e.g. spotify):" Margin="0,10,0,2"/>
         <TextBox x:Name="TxtExcluded" Height="70" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"/>
@@ -26,9 +27,13 @@
             <Button x:Name="BtnRestoreNow" Content="Restore audio now" Padding="10,4" Click="BtnRestoreNow_Click"/>
         </StackPanel>
 
-        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
-            <Button x:Name="BtnSave" Content="Save" Width="80" Margin="0,0,8,0" Click="BtnSave_Click" IsDefault="True"/>
-            <Button x:Name="BtnClose" Content="Close" Width="80" Click="BtnClose_Click" IsCancel="True"/>
-        </StackPanel>
+        <Grid Margin="0,14,0,0">
+            <TextBlock x:Name="VersionText" Text="v0.0.0" Foreground="Gray"
+                       HorizontalAlignment="Left" VerticalAlignment="Center"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="BtnSave" Content="Save" Width="80" Margin="0,0,8,0" Click="BtnSave_Click" IsDefault="True"/>
+                <Button x:Name="BtnClose" Content="Close" Width="80" Click="BtnClose_Click" IsCancel="True"/>
+            </StackPanel>
+        </Grid>
     </StackPanel>
 </Window>

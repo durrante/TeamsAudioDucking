@@ -36,6 +36,12 @@ public partial class App : System.Windows.Application
 
         _ducker = new AudioDucker(_settings);
         _ducker.StateChanged += () => RunOnUi(UpdateTray);
+
+        _detector = new TeamsCallDetector(_settings);
+        _detector.CallStateChanged += OnCallStateChanged;
+        // Teams playback activity feeds the ring heuristic; wire before the
+        // ducker starts so no early event is lost.
+        _ducker.TeamsPlaybackChanged += _detector.NotifyTeamsPlayback;
         _ducker.Start();
 
         _tray = new TrayIcon();
@@ -43,10 +49,9 @@ public partial class App : System.Windows.Application
         _tray.MuteNowClicked += () => { _ducker.DuckAll("manual"); RunOnUi(UpdateTray); };
         _tray.RestoreNowClicked += () => { _ducker.RestoreAll("manual"); RunOnUi(UpdateTray); };
         _tray.SettingsClicked += ShowSettings;
+        _tray.AboutClicked += ShowAbout;
         _tray.ExitClicked += ExitApplication;
 
-        _detector = new TeamsCallDetector(_settings);
-        _detector.CallStateChanged += OnCallStateChanged;
         _detector.Start(); // synchronously evaluates once; fires the event if already in a call
 
         // If a previous run was killed while apps were muted (and we are not in
@@ -115,6 +120,7 @@ public partial class App : System.Windows.Application
         {
             _detector.Evaluate();
             if (_settings.Enabled) _ducker.EnsureDucked();
+            if (_settings.TraceSessionEvents) _ducker.LogSessionSnapshot();
         }
         catch (Exception ex)
         {
@@ -133,6 +139,7 @@ public partial class App : System.Windows.Application
             try
             {
                 _ducker.RefreshDevices();
+                _ducker.RescanTeamsSessions();
                 _detector.Evaluate();
                 if (_settings.Enabled) _ducker.EnsureDucked();
             }
@@ -179,6 +186,18 @@ public partial class App : System.Windows.Application
                 StatusText);
             _settingsWindow.Show();
         });
+    }
+
+    private void ShowAbout()
+    {
+        RunOnUi(() => System.Windows.MessageBox.Show(
+            $"Teams Audio Ducking v{AppInfo.Version}\n\n" +
+            "Automatically mutes other applications' audio during Microsoft Teams " +
+            "calls and restores each app's exact previous state afterwards.\n\n" +
+            $"Settings and logs:\n{AppSettings.DataDirectory}\n\n" +
+            "Runs entirely locally: no internet access, no telemetry, no audio recording.",
+            "About Teams Audio Ducking",
+            MessageBoxButton.OK, MessageBoxImage.Information));
     }
 
     private void ExitApplication()

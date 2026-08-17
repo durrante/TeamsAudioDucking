@@ -28,6 +28,7 @@ public sealed class TrayIcon : IDisposable
     public event Action? MuteNowClicked;
     public event Action? RestoreNowClicked;
     public event Action? SettingsClicked;
+    public event Action? AboutClicked;
     public event Action? ExitClicked;
 
     public TrayIcon()
@@ -50,6 +51,8 @@ public sealed class TrayIcon : IDisposable
         restoreNow.Click += (_, _) => RestoreNowClicked?.Invoke();
         var settings = new ToolStripMenuItem("Settings...");
         settings.Click += (_, _) => SettingsClicked?.Invoke();
+        var about = new ToolStripMenuItem($"About Teams Audio Ducking... (v{Core.AppInfo.Version})");
+        about.Click += (_, _) => AboutClicked?.Invoke();
         var exit = new ToolStripMenuItem("Exit");
         exit.Click += (_, _) => ExitClicked?.Invoke();
 
@@ -62,13 +65,14 @@ public sealed class TrayIcon : IDisposable
         menu.Items.Add(restoreNow);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(settings);
+        menu.Items.Add(about);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exit);
 
         _notifyIcon = new NotifyIcon
         {
             Icon = _iconIdle,
-            Text = "Teams Audio Ducking",
+            Text = $"Teams Audio Ducking v{Core.AppInfo.Version}",
             Visible = true,
             ContextMenuStrip = menu,
         };

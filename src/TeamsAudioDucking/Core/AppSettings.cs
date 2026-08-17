@@ -10,6 +10,12 @@ public sealed class AppSettings
     public bool StartWithWindows { get; set; } = true;
     public bool MuteSystemSounds { get; set; }
 
+    /// <summary>Also start muting while a Teams call is ringing (sustained Teams playback heuristic).</summary>
+    public bool MuteWhileRinging { get; set; } = true;
+
+    /// <summary>Diagnostic: log audio session creations and periodic session snapshots.</summary>
+    public bool TraceSessionEvents { get; set; }
+
     /// <summary>Processes never muted (in addition to Teams itself). Names without .exe.</summary>
     public List<string> ExcludedProcesses { get; set; } = new();
 

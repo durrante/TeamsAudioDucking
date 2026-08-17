@@ -27,6 +27,37 @@ public sealed class AudioDucker : IDisposable
         public AudioSessionManager.SessionCreatedDelegate? Handler;
     }
 
+    private sealed class TeamsSessionEntry
+    {
+        public AudioSessionControl Control = null!;
+        public TeamsSessionEventsHandler Handler = null!;
+        public string ProcessName = "";
+        public bool Active;
+        /// <summary>
+        /// Only calibrated sessions count towards "Teams is playing audio".
+        /// Sessions we saw being created are trusted immediately; sessions
+        /// found by a scan must first be seen Inactive once, so a Teams
+        /// session that happens to sit permanently Active cannot fake a
+        /// perpetual ring.
+        /// </summary>
+        public bool Calibrated;
+    }
+
+    private sealed class TeamsSessionEventsHandler : IAudioSessionEventsHandler
+    {
+        private readonly AudioDucker _owner;
+        private readonly string _key;
+        public TeamsSessionEventsHandler(AudioDucker owner, string key) { _owner = owner; _key = key; }
+        public void OnStateChanged(AudioSessionState state) => _owner.OnTeamsSessionStateChanged(_key, state);
+        public void OnSessionDisconnected(AudioSessionDisconnectReason disconnectReason)
+            => _owner.OnTeamsSessionStateChanged(_key, AudioSessionState.AudioSessionStateExpired);
+        public void OnVolumeChanged(float volume, bool isMuted) { }
+        public void OnDisplayNameChanged(string displayName) { }
+        public void OnIconPathChanged(string iconPath) { }
+        public void OnChannelVolumeChanged(uint channelCount, nint newVolumes, uint channelIndex) { }
+        public void OnGroupingParamChanged(ref Guid groupingId) { }
+    }
+
     private sealed class EndpointNotificationClient : IMMNotificationClient
     {
         private readonly AudioDucker _owner;
@@ -50,9 +81,11 @@ public sealed class AudioDucker : IDisposable
     private readonly int _ownPid = Environment.ProcessId;
     private List<MuteRecord> _records = new();   // sessions we muted, awaiting restore
     private List<MuteRecord> _pending = new();   // sessions that vanished while muted; restore when they reappear
+    private readonly Dictionary<string, TeamsSessionEntry> _teamsSessions = new();
     private MMDeviceEnumerator? _enumerator;
     private EndpointNotificationClient? _notificationClient;
     private System.Threading.Timer? _deviceRefreshTimer;
+    private bool _teamsPlaybackActive;
     private bool _ducking;
     private bool _disposed;
 
@@ -61,6 +94,13 @@ public sealed class AudioDucker : IDisposable
 
     /// <summary>Raised (on arbitrary threads) whenever the muted set changes.</summary>
     public event Action? StateChanged;
+
+    /// <summary>
+    /// Raised (on arbitrary threads) when Teams starts/stops playing audio
+    /// through any of its render sessions. Feeds the ring-detection heuristic
+    /// in <see cref="TeamsCallDetector"/>.
+    /// </summary>
+    public event Action<bool>? TeamsPlaybackChanged;
 
     public bool IsDucking { get { lock (_lock) return _ducking; } }
     public int MutedCount { get { lock (_lock) return _records.Count; } }
@@ -71,6 +111,7 @@ public sealed class AudioDucker : IDisposable
     public void Start()
     {
         int deviceCount;
+        bool playbackChanged, playbackNow;
         lock (_lock)
         {
             _enumerator = new MMDeviceEnumerator();
@@ -78,9 +119,12 @@ public sealed class AudioDucker : IDisposable
             _enumerator.RegisterEndpointNotificationCallback(_notificationClient);
             RefreshDevicesLocked();
             LoadStateLocked();
+            playbackChanged = ScanTeamsSessionsLocked();
+            playbackNow = _teamsPlaybackActive;
             deviceCount = _devices.Count;
         }
         Logger.Info($"Audio ducker started ({deviceCount} active render device(s))");
+        if (playbackChanged) TeamsPlaybackChanged?.Invoke(playbackNow);
     }
 
     // ------------------------------------------------------------------ mute
@@ -343,6 +387,7 @@ public sealed class AudioDucker : IDisposable
         Task.Run(() =>
         {
             bool changed = false;
+            bool playbackChanged = false, playbackNow = false;
             try
             {
                 var session = new AudioSessionControl(rawSession);
@@ -356,7 +401,21 @@ public sealed class AudioDucker : IDisposable
                     }
                     if (holder == null) return;
 
-                    if (_ducking)
+                    var processName = ResolveSessionProcessName(session, out _);
+                    if (_settings.TraceSessionEvents)
+                        Logger.Info($"[trace] Session created: {processName ?? "<gone>"} on '{holder.Name}', state={SafeState(session)}");
+
+                    // Teams' own sessions are never muted, but we watch their
+                    // activity for ring detection. A session we see being
+                    // created is trusted immediately (an outbound ring makes a
+                    // fresh, already-active session).
+                    if (processName != null && _settings.IsTeamsProcess(processName))
+                    {
+                        RegisterTeamsSessionLocked(session, processName, trustInitialState: true);
+                        playbackChanged = RecomputeTeamsPlaybackLocked();
+                        playbackNow = _teamsPlaybackActive;
+                    }
+                    else if (_ducking)
                     {
                         int before = _records.Count;
                         TryMuteSessionLocked(holder, session);
@@ -373,8 +432,151 @@ public sealed class AudioDucker : IDisposable
             {
                 Logger.Warn($"New-session handling failed: {ex.Message}");
             }
+            if (playbackChanged) TeamsPlaybackChanged?.Invoke(playbackNow);
             if (changed) StateChanged?.Invoke();
         });
+    }
+
+    // ------------------------------------------- Teams playback (ring) watch
+
+    private void RegisterTeamsSessionLocked(AudioSessionControl session, string processName, bool trustInitialState)
+    {
+        string key = SafeInstanceId(session);
+        if (key.Length == 0) key = Guid.NewGuid().ToString("N");
+        if (_teamsSessions.ContainsKey(key)) return;
+
+        var entry = new TeamsSessionEntry
+        {
+            Control = session,
+            ProcessName = processName,
+            Handler = new TeamsSessionEventsHandler(this, key),
+        };
+        try
+        {
+            entry.Active = session.State == AudioSessionState.AudioSessionStateActive;
+            session.RegisterEventClient(entry.Handler);
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Could not watch Teams session ({processName}): {ex.Message}");
+            return;
+        }
+        // Scan-discovered sessions must be seen Inactive once before their
+        // Active state counts (see TeamsSessionEntry.Calibrated).
+        entry.Calibrated = trustInitialState || !entry.Active;
+        _teamsSessions[key] = entry;
+        if (_settings.TraceSessionEvents)
+            Logger.Info($"[trace] Watching Teams session: {processName} (active={entry.Active}, calibrated={entry.Calibrated})");
+    }
+
+    private void OnTeamsSessionStateChanged(string key, AudioSessionState state)
+    {
+        bool playbackChanged, playbackNow;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            if (!_teamsSessions.TryGetValue(key, out var entry)) return;
+
+            if (state == AudioSessionState.AudioSessionStateExpired)
+            {
+                UnregisterTeamsSessionLocked(key, entry);
+            }
+            else
+            {
+                entry.Active = state == AudioSessionState.AudioSessionStateActive;
+                if (state == AudioSessionState.AudioSessionStateInactive) entry.Calibrated = true;
+            }
+            playbackChanged = RecomputeTeamsPlaybackLocked();
+            playbackNow = _teamsPlaybackActive;
+        }
+        if (playbackChanged) TeamsPlaybackChanged?.Invoke(playbackNow);
+    }
+
+    private bool RecomputeTeamsPlaybackLocked()
+    {
+        bool active = _teamsSessions.Values.Any(e => e.Calibrated && e.Active);
+        if (active == _teamsPlaybackActive) return false;
+        _teamsPlaybackActive = active;
+        if (_settings.TraceSessionEvents)
+            Logger.Info($"[trace] Teams playback -> {(active ? "active" : "inactive")}");
+        return true;
+    }
+
+    /// <summary>
+    /// Safety net: prunes dead Teams sessions and registers any this instance
+    /// has not seen yet (with calibration required). Returns true if the
+    /// overall playback state changed.
+    /// </summary>
+    private bool ScanTeamsSessionsLocked()
+    {
+        foreach (var (key, entry) in _teamsSessions.ToList())
+        {
+            bool dead;
+            try { dead = entry.Control.State == AudioSessionState.AudioSessionStateExpired; }
+            catch { dead = true; }
+            if (dead) UnregisterTeamsSessionLocked(key, entry);
+        }
+
+        foreach (var holder in _devices.Values)
+        {
+            foreach (var session in GetSessionsLocked(holder))
+            {
+                try
+                {
+                    if (session.State == AudioSessionState.AudioSessionStateExpired) continue;
+                    string id = SafeInstanceId(session);
+                    if (id.Length > 0 && _teamsSessions.ContainsKey(id)) continue;
+                    var processName = ResolveSessionProcessName(session, out bool isSystemSounds);
+                    if (isSystemSounds || processName == null) continue;
+                    if (_settings.IsTeamsProcess(processName))
+                        RegisterTeamsSessionLocked(session, processName, trustInitialState: false);
+                }
+                catch { }
+            }
+        }
+        return RecomputeTeamsPlaybackLocked();
+    }
+
+    private void UnregisterTeamsSessionLocked(string key, TeamsSessionEntry entry)
+    {
+        _teamsSessions.Remove(key);
+        try { entry.Control.UnRegisterEventClient(entry.Handler); } catch { }
+        if (_settings.TraceSessionEvents)
+            Logger.Info($"[trace] Teams session gone: {entry.ProcessName}");
+    }
+
+    /// <summary>Public wrapper used after resume from sleep and by the reconcile sweep.</summary>
+    public void RescanTeamsSessions()
+    {
+        bool playbackChanged, playbackNow;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            playbackChanged = ScanTeamsSessionsLocked();
+            playbackNow = _teamsPlaybackActive;
+        }
+        if (playbackChanged) TeamsPlaybackChanged?.Invoke(playbackNow);
+    }
+
+    /// <summary>Diagnostic dump of every session on every device (trace mode).</summary>
+    public void LogSessionSnapshot()
+    {
+        lock (_lock)
+        {
+            if (_disposed) return;
+            foreach (var holder in _devices.Values)
+            {
+                foreach (var session in GetSessionsLocked(holder))
+                {
+                    try
+                    {
+                        var name = ResolveSessionProcessName(session, out bool sys) ?? "<gone>";
+                        Logger.Info($"[trace] '{holder.Name}': {(sys ? "System Sounds" : name)} state={SafeState(session)} muted={session.SimpleAudioVolume.Mute}");
+                    }
+                    catch { }
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -492,6 +694,7 @@ public sealed class AudioDucker : IDisposable
             {
                 try
                 {
+                    bool playbackChanged, playbackNow;
                     lock (_lock)
                     {
                         if (_disposed) return;
@@ -501,7 +704,10 @@ public sealed class AudioDucker : IDisposable
                             foreach (var holder in _devices.Values) MuteDeviceSessionsLocked(holder);
                             PersistLocked();
                         }
+                        playbackChanged = ScanTeamsSessionsLocked();
+                        playbackNow = _teamsPlaybackActive;
                     }
+                    if (playbackChanged) TeamsPlaybackChanged?.Invoke(playbackNow);
                     StateChanged?.Invoke();
                 }
                 catch (Exception ex)
@@ -539,6 +745,45 @@ public sealed class AudioDucker : IDisposable
         foreach (var id in map.Keys)
         {
             if (id != preferred) yield return id;
+        }
+    }
+
+    /// <summary>Process name for a session, or "System Sounds"; null if the process is gone.</summary>
+    private string? ResolveSessionProcessName(AudioSessionControl session, out bool isSystemSounds)
+    {
+        isSystemSounds = false;
+        try
+        {
+            if (session.IsSystemSoundsSession)
+            {
+                isSystemSounds = true;
+                return "System Sounds";
+            }
+            int pid = (int)session.GetProcessID;
+            if (pid == 0 || pid == _ownPid) return null;
+            return GetProcessName(pid);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string SafeState(AudioSessionControl session)
+    {
+        try
+        {
+            return session.State switch
+            {
+                AudioSessionState.AudioSessionStateActive => "Active",
+                AudioSessionState.AudioSessionStateInactive => "Inactive",
+                AudioSessionState.AudioSessionStateExpired => "Expired",
+                _ => session.State.ToString(),
+            };
+        }
+        catch
+        {
+            return "?";
         }
     }
 
@@ -619,6 +864,11 @@ public sealed class AudioDucker : IDisposable
             if (_disposed) return;
             _disposed = true;
             _deviceRefreshTimer?.Dispose();
+            foreach (var (_, entry) in _teamsSessions.ToList())
+            {
+                try { entry.Control.UnRegisterEventClient(entry.Handler); } catch { }
+            }
+            _teamsSessions.Clear();
             try
             {
                 if (_enumerator != null && _notificationClient != null)

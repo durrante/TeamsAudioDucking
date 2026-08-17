@@ -6,22 +6,27 @@ using Microsoft.Win32.SafeHandles;
 namespace TeamsAudioDucking.Core;
 
 /// <summary>
-/// Detects an active Microsoft Teams call/meeting.
+/// Detects an active Microsoft Teams call/meeting using two signals:
 ///
-/// Approach: there is no public local API for the new Teams client's call state.
-/// The most reliable Windows-level signal is that Teams holds an open microphone
-/// capture stream for the whole duration of a call or meeting (even while you are
-/// muted inside Teams - it keeps the stream open so unmute is instant).
+/// 1. Microphone (authoritative): Teams holds an open microphone capture
+///    stream for the whole duration of a connected call - even while muted
+///    inside Teams. Windows tracks per-app mic usage in the
+///    CapabilityAccessManager ConsentStore registry key (LastUsedTimeStop == 0
+///    while in use), which we watch with RegNotifyChangeKeyValue
+///    (event-driven, no polling). A process-liveness check makes a Teams
+///    crash end the call state immediately.
 ///
-/// Windows tracks per-app microphone usage in the CapabilityAccessManager
-/// ConsentStore registry key: while an app is using the mic, its
-/// LastUsedTimeStop value is 0. We watch that key with RegNotifyChangeKeyValue
-/// (event-driven, no polling) and treat "Teams is using the microphone AND a
-/// Teams process is running" as "in a call". The process check makes a Teams
-/// crash mid-call end the state immediately even if the registry lags.
+/// 2. Playback (ring heuristic): while an outbound call is ringing (or an
+///    incoming call is ringing), Teams has not opened the mic yet, but it IS
+///    playing the ring tone through its own render session. AudioDucker
+///    watches Teams' playback sessions and reports activity here; sustained
+///    playback (>= RingSustainMs) counts as the call starting. Short
+///    notification sounds never sustain that long. Once the mic has been seen
+///    in a call, the mic signal alone decides when the call ends, so lingering
+///    playback cannot delay the restore.
 ///
-/// A short debounce is applied to the "call ended" transition because Teams can
-/// briefly release and reacquire the microphone when switching audio devices.
+/// A short debounce is applied to the "call ended" transition because Teams
+/// can briefly release the mic when switching audio devices mid-call.
 /// </summary>
 public sealed class TeamsCallDetector : IDisposable
 {
@@ -34,6 +39,7 @@ public sealed class TeamsCallDetector : IDisposable
     private static readonly string[] RegistryTokens = { "msteams_", "slimcorevdihost", "ms-teams.exe", "teams.exe" };
 
     private const int EndDebounceMs = 2000;
+    private const int RingSustainMs = 1500;
 
     [DllImport("advapi32.dll")]
     private static extern int RegNotifyChangeKeyValue(
@@ -49,6 +55,10 @@ public sealed class TeamsCallDetector : IDisposable
     private readonly AutoResetEvent _changeEvent = new(false);
     private Thread? _watcherThread;
     private System.Threading.Timer? _endDebounceTimer;
+    private System.Threading.Timer? _ringSustainTimer;
+    private bool _playbackActive;    // Teams render session currently playing (per AudioDucker)
+    private bool _ringQualified;     // playback sustained long enough to count as a ring/call
+    private bool _micSeenThisCall;   // once the mic was used, only the mic ends the call
     private volatile bool _inCall;
     private bool _disposed;
 
@@ -68,7 +78,7 @@ public sealed class TeamsCallDetector : IDisposable
         Evaluate();
         _watcherThread = new Thread(WatchLoop) { IsBackground = true, Name = "TeamsCallWatcher" };
         _watcherThread.Start();
-        Logger.Info("Teams call detector started (microphone ConsentStore watcher)");
+        Logger.Info("Teams call detector started (microphone ConsentStore watcher + playback heuristic)");
     }
 
     private void WatchLoop()
@@ -112,15 +122,66 @@ public sealed class TeamsCallDetector : IDisposable
     }
 
     /// <summary>
+    /// Called by AudioDucker (any thread) whenever Teams' playback activity
+    /// changes. Sustained playback qualifies as "ringing/starting a call".
+    /// </summary>
+    public void NotifyTeamsPlayback(bool active)
+    {
+        bool evaluate = false;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _playbackActive = active;
+            if (active)
+            {
+                if (!_ringQualified && _ringSustainTimer == null)
+                    _ringSustainTimer = new System.Threading.Timer(_ => RingSustainElapsed(), null, RingSustainMs, Timeout.Infinite);
+            }
+            else
+            {
+                _ringSustainTimer?.Dispose();
+                _ringSustainTimer = null;
+                if (_ringQualified)
+                {
+                    _ringQualified = false;
+                    evaluate = true; // ring stopped without connecting -> may end the call state
+                }
+            }
+        }
+        if (evaluate) Evaluate();
+    }
+
+    private void RingSustainElapsed()
+    {
+        bool qualified = false;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _ringSustainTimer?.Dispose();
+            _ringSustainTimer = null;
+            if (_playbackActive)
+            {
+                _ringQualified = true;
+                qualified = true;
+            }
+        }
+        if (qualified)
+        {
+            Logger.Info("Teams playback sustained (ringing or call audio)");
+            Evaluate();
+        }
+    }
+
+    /// <summary>
     /// Re-checks the call state now. Cheap; also called from the slow
     /// reconciliation timer and after resume from sleep.
     /// </summary>
     public void Evaluate()
     {
-        bool raw;
+        bool mic;
         try
         {
-            raw = TeamsMicInUse() && TeamsProcessRunning();
+            mic = TeamsProcessRunning() && TeamsMicInUse();
         }
         catch (Exception ex)
         {
@@ -129,9 +190,16 @@ public sealed class TeamsCallDetector : IDisposable
         }
 
         bool? fire = null;
+        string trigger = "microphone";
         lock (_lock)
         {
             if (_disposed) return;
+            if (_inCall && mic) _micSeenThisCall = true;
+            bool ring = _ringQualified && _settings.MuteWhileRinging;
+            // Once the mic has been in use, lingering playback (hang-up tone,
+            // Teams UI sounds) must not keep the call alive.
+            bool raw = _micSeenThisCall ? mic : (mic || ring);
+
             if (raw)
             {
                 _endDebounceTimer?.Dispose();
@@ -139,30 +207,34 @@ public sealed class TeamsCallDetector : IDisposable
                 if (!_inCall)
                 {
                     _inCall = true;
+                    if (mic) _micSeenThisCall = true;
+                    else trigger = "ringing";
                     fire = true;
                 }
             }
             else if (_inCall && _endDebounceTimer == null)
             {
-                // Confirm the end after a short delay to ignore brief mic
-                // releases (e.g. Teams switching audio devices mid-call).
                 _endDebounceTimer = new System.Threading.Timer(_ => ConfirmEnded(), null, EndDebounceMs, Timeout.Infinite);
             }
         }
 
-        if (fire.HasValue) CallStateChanged?.Invoke(fire.Value);
+        if (fire.HasValue)
+        {
+            Logger.Info($"Call state -> active (trigger: {trigger})");
+            CallStateChanged?.Invoke(fire.Value);
+        }
     }
 
     private void ConfirmEnded()
     {
-        bool raw;
+        bool mic;
         try
         {
-            raw = TeamsMicInUse() && TeamsProcessRunning();
+            mic = TeamsProcessRunning() && TeamsMicInUse();
         }
         catch
         {
-            raw = false;
+            mic = false;
         }
 
         bool fire = false;
@@ -171,9 +243,15 @@ public sealed class TeamsCallDetector : IDisposable
             if (_disposed) return;
             _endDebounceTimer?.Dispose();
             _endDebounceTimer = null;
+            bool ring = _ringQualified && _settings.MuteWhileRinging;
+            bool raw = _micSeenThisCall ? mic : (mic || ring);
             if (!raw && _inCall)
             {
                 _inCall = false;
+                _micSeenThisCall = false;
+                // Require a fresh sustained-playback episode to re-enter via
+                // the ring path (prevents a hang-up tone re-triggering).
+                _ringQualified = false;
                 fire = true;
             }
         }
@@ -239,6 +317,8 @@ public sealed class TeamsCallDetector : IDisposable
             _disposed = true;
             _endDebounceTimer?.Dispose();
             _endDebounceTimer = null;
+            _ringSustainTimer?.Dispose();
+            _ringSustainTimer = null;
         }
         _stopEvent.Set();
         _watcherThread?.Join(2000);
