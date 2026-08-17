@@ -15,4 +15,10 @@ public sealed class MuteRecord
     public bool WasMuted { get; set; }
     public float PreviousVolume { get; set; }
     public DateTime MutedAtUtc { get; set; }
+
+    /// <summary>
+    /// True for records where only the volume was changed (Teams call-volume
+    /// boost): restore must not touch the session's mute flag.
+    /// </summary>
+    public bool VolumeOnly { get; set; }
 }

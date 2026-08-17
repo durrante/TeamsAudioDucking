@@ -24,6 +24,8 @@ public partial class SettingsWindow : Window
         ChkStartup.IsChecked = StartupManager.IsEnabled();
         ChkSystemSounds.IsChecked = settings.MuteSystemSounds;
         ChkRinging.IsChecked = settings.MuteWhileRinging;
+        ChkBoost.IsChecked = settings.BoostTeamsVolume;
+        TxtBoostPercent.Text = settings.TeamsCallVolumePercent.ToString();
         TxtExcluded.Text = string.Join(Environment.NewLine, settings.ExcludedProcesses);
         TxtAlwaysMute.Text = string.Join(Environment.NewLine, settings.AlwaysMuteProcesses);
         VersionText.Text = $"v{AppInfo.Version}";
@@ -45,6 +47,10 @@ public partial class SettingsWindow : Window
         _settings.StartWithWindows = ChkStartup.IsChecked == true;
         _settings.MuteSystemSounds = ChkSystemSounds.IsChecked == true;
         _settings.MuteWhileRinging = ChkRinging.IsChecked == true;
+        _settings.BoostTeamsVolume = ChkBoost.IsChecked == true;
+        if (int.TryParse(TxtBoostPercent.Text.Trim(), out int pct))
+            _settings.TeamsCallVolumePercent = Math.Clamp(pct, 1, 100);
+        TxtBoostPercent.Text = _settings.TeamsCallVolumePercent.ToString();
         _settings.ExcludedProcesses = ParseList(TxtExcluded.Text);
         _settings.AlwaysMuteProcesses = ParseList(TxtAlwaysMute.Text);
         _settings.Save();

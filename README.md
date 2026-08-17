@@ -100,6 +100,11 @@ wrapper) to control **individual application audio sessions**:
   (state is kept for up to 24 hours).
 - Mute state is persisted to disk, so if the utility itself is killed
   mid-call, the next start restores everything.
+- Optionally (off by default) raises **Teams' own** session volume to a
+  configurable level during calls, so the call is louder without touching the
+  master volume. It only ever *raises* Teams (never lowers it), applies once
+  per call (dragging the slider down mid-call is respected), and the prior
+  volume is restored exactly when the call ends.
 
 Never touched: master volume, microphone, default playback device, device
 enable/disable state, Teams' own sessions.
@@ -137,7 +142,7 @@ Two options, both per-user and admin-free:
 iscc installer\TeamsAudioDucking.iss   # needs Inno Setup 6
 ```
 
-Produces `installer\Output\TeamsAudioDucking-Setup-1.1.0.exe` with a proper
+Produces `installer\Output\TeamsAudioDucking-Setup-1.2.0.exe` with a proper
 uninstaller, Start-menu shortcut and an optional "start at sign-in" task.
 
 Installs to `%LOCALAPPDATA%\Programs\TeamsAudioDucking`. Startup uses the
@@ -166,6 +171,7 @@ Settings (also editable as JSON, see below):
 - Mute Windows system sounds too (off by default)
 - Start muting while a Teams call is ringing (on by default; see
   *Ring detection* above)
+- Raise Teams' own volume during calls to a set percentage (off by default)
 - Exclusion list: processes never muted (one per line, e.g. `spotify`)
 - Always-mute list: processes muted during calls even if excluded
 
@@ -208,6 +214,9 @@ build.ps1                    publish helper
 
 ## Changelog
 
+- **1.2.0**: optional Teams call-volume boost: raise Teams' own session volume
+  to a configurable percentage during calls, restored exactly afterwards
+  (never the master volume, never lowered).
 - **1.1.0**: muting now starts while a call is ringing (Teams playback
   heuristic, can be disabled in Settings); About menu item with version in
   the tray; proper application icon (window title bars, taskbar, Explorer);

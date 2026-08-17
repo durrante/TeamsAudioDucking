@@ -73,6 +73,7 @@ public sealed class AudioDucker : IDisposable
     {
         public List<MuteRecord> Records { get; set; } = new();
         public List<MuteRecord> Pending { get; set; } = new();
+        public List<MuteRecord> Boosted { get; set; } = new();
     }
 
     private readonly AppSettings _settings;
@@ -81,6 +82,7 @@ public sealed class AudioDucker : IDisposable
     private readonly int _ownPid = Environment.ProcessId;
     private List<MuteRecord> _records = new();   // sessions we muted, awaiting restore
     private List<MuteRecord> _pending = new();   // sessions that vanished while muted; restore when they reappear
+    private List<MuteRecord> _boosted = new();   // Teams sessions whose volume we raised for the call
     private readonly Dictionary<string, TeamsSessionEntry> _teamsSessions = new();
     private MMDeviceEnumerator? _enumerator;
     private EndpointNotificationClient? _notificationClient;
@@ -104,7 +106,7 @@ public sealed class AudioDucker : IDisposable
 
     public bool IsDucking { get { lock (_lock) return _ducking; } }
     public int MutedCount { get { lock (_lock) return _records.Count; } }
-    public bool HasLeftoverRecords { get { lock (_lock) return _records.Count > 0; } }
+    public bool HasLeftoverRecords { get { lock (_lock) return _records.Count > 0 || _boosted.Count > 0; } }
 
     public AudioDucker(AppSettings settings) => _settings = settings;
 
@@ -138,6 +140,7 @@ public sealed class AudioDucker : IDisposable
             Logger.Info($"Muting other applications ({reason})");
             RefreshDevicesLocked();
             foreach (var holder in _devices.Values) MuteDeviceSessionsLocked(holder);
+            BoostTeamsSessionsLocked();
             PersistLocked();
         }
         StateChanged?.Invoke();
@@ -156,7 +159,8 @@ public sealed class AudioDucker : IDisposable
             int before = _records.Count;
             RefreshDevicesLocked();
             foreach (var holder in _devices.Values) MuteDeviceSessionsLocked(holder);
-            changed = _records.Count != before;
+            bool boostChanged = BoostTeamsSessionsLocked();
+            changed = _records.Count != before || boostChanged;
             if (changed) PersistLocked();
         }
         if (changed) StateChanged?.Invoke();
@@ -275,6 +279,76 @@ public sealed class AudioDucker : IDisposable
         Logger.Info($"Muted: {processName} (volume was {(int)(record.PreviousVolume * 100)}%, device '{holder.Name}')");
     }
 
+    // ------------------------------------------------- Teams volume boost
+
+    /// <summary>
+    /// Raises every Teams session sitting below the configured call volume to
+    /// that level, recording the prior volume for exact restore. Boost is
+    /// applied once per session; if the user then drags Teams' slider down
+    /// mid-call, that choice is respected (no re-assert).
+    /// </summary>
+    private bool BoostTeamsSessionsLocked()
+    {
+        if (!_settings.BoostTeamsVolume) return false;
+        bool changed = false;
+        foreach (var holder in _devices.Values)
+        {
+            foreach (var session in GetSessionsLocked(holder))
+            {
+                try
+                {
+                    var name = ResolveSessionProcessName(session, out bool isSystemSounds);
+                    if (isSystemSounds || name == null || !_settings.IsTeamsProcess(name)) continue;
+                    if (TryBoostSessionLocked(holder, session, name)) changed = true;
+                }
+                catch { }
+            }
+        }
+        return changed;
+    }
+
+    private bool TryBoostSessionLocked(DeviceHolder holder, AudioSessionControl session, string processName)
+    {
+        if (!_settings.BoostTeamsVolume) return false;
+        try
+        {
+            if (session.State == AudioSessionState.AudioSessionStateExpired) return false;
+            float target = Math.Clamp(_settings.TeamsCallVolumePercent, 1, 100) / 100f;
+
+            string instanceId = SafeInstanceId(session);
+            if (instanceId.Length > 0 && _boosted.Any(r => r.SessionInstanceId == instanceId))
+                return false; // already boosted this call
+
+            var volume = session.SimpleAudioVolume;
+            float current = SafeVolume(volume);
+            if (current >= target) return false; // never lower Teams' volume
+
+            int pid = 0;
+            try { pid = (int)session.GetProcessID; } catch { }
+
+            volume.Volume = target;
+            _boosted.Add(new MuteRecord
+            {
+                DeviceId = holder.Id,
+                SessionInstanceId = instanceId,
+                Pid = pid,
+                ProcessName = processName,
+                IsSystemSounds = false,
+                WasMuted = false,
+                PreviousVolume = current,
+                VolumeOnly = true,
+                MutedAtUtc = DateTime.UtcNow,
+            });
+            Logger.Info($"Raised Teams volume: {processName} {(int)(current * 100)}% -> {(int)(target * 100)}% (device '{holder.Name}')");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn($"Could not raise Teams volume ({processName}): {ex.Message}");
+            return false;
+        }
+    }
+
     // --------------------------------------------------------------- restore
 
     public void RestoreAll(string reason)
@@ -283,7 +357,7 @@ public sealed class AudioDucker : IDisposable
         {
             if (_disposed) return;
             _ducking = false;
-            if (_records.Count == 0)
+            if (_records.Count == 0 && _boosted.Count == 0)
             {
                 PersistLocked();
                 Logger.Info($"Restore requested ({reason}); nothing to restore");
@@ -310,7 +384,20 @@ public sealed class AudioDucker : IDisposable
                         Logger.Warn($"Session for {record.ProcessName} no longer present; will restore it if it reappears");
                     }
                 }
+                foreach (var record in _boosted)
+                {
+                    if (TryRestoreLocked(record, sessionsByDevice))
+                    {
+                        Logger.Info($"Restored Teams volume: {record.ProcessName} to {(int)(record.PreviousVolume * 100)}%");
+                    }
+                    else
+                    {
+                        stillPending.Add(record);
+                        Logger.Warn($"Teams session for {record.ProcessName} no longer present; will restore its volume if it reappears");
+                    }
+                }
                 _records = new List<MuteRecord>();
+                _boosted = new List<MuteRecord>();
                 _pending.AddRange(stillPending);
                 PrunePendingLocked();
                 PersistLocked();
@@ -350,11 +437,14 @@ public sealed class AudioDucker : IDisposable
                             var name = GetProcessName(pid);
                             if (name == null) continue;
                             if (AppSettings.Normalize(name) != AppSettings.Normalize(record.ProcessName)) continue;
-                            if (!session.SimpleAudioVolume.Mute) continue; // only touch sessions that are actually muted
+                            // Only touch sessions that are actually muted (volume-only
+                            // records carry no mute, so any same-process session matches:
+                            // Windows persists per-app volume across session recreation).
+                            if (!record.VolumeOnly && !session.SimpleAudioVolume.Mute) continue;
                         }
 
                         var volume = session.SimpleAudioVolume;
-                        volume.Mute = record.WasMuted;
+                        if (!record.VolumeOnly) volume.Mute = record.WasMuted;
                         volume.Volume = record.PreviousVolume;
                         return true;
                     }
@@ -412,6 +502,14 @@ public sealed class AudioDucker : IDisposable
                     if (processName != null && _settings.IsTeamsProcess(processName))
                     {
                         RegisterTeamsSessionLocked(session, processName, trustInitialState: true);
+                        if (_ducking)
+                        {
+                            if (TryBoostSessionLocked(holder, session, processName)) PersistLocked();
+                        }
+                        else
+                        {
+                            changed = TryApplyPendingLocked(session);
+                        }
                         playbackChanged = RecomputeTeamsPlaybackLocked();
                         playbackNow = _teamsPlaybackActive;
                     }
@@ -609,7 +707,7 @@ public sealed class AudioDucker : IDisposable
         try
         {
             var volume = session.SimpleAudioVolume;
-            volume.Mute = match.WasMuted;
+            if (!match.VolumeOnly) volume.Mute = match.WasMuted;
             volume.Volume = match.PreviousVolume;
         }
         catch
@@ -823,7 +921,7 @@ public sealed class AudioDucker : IDisposable
         try
         {
             Directory.CreateDirectory(AppSettings.DataDirectory);
-            var state = new PersistedState { Records = _records, Pending = _pending };
+            var state = new PersistedState { Records = _records, Pending = _pending, Boosted = _boosted };
             File.WriteAllText(StatePath, JsonSerializer.Serialize(state, JsonOpts));
         }
         catch (Exception ex)
@@ -841,8 +939,9 @@ public sealed class AudioDucker : IDisposable
             if (state == null) return;
             _records = state.Records;
             _pending = state.Pending;
-            if (_records.Count > 0 || _pending.Count > 0)
-                Logger.Info($"Loaded persisted state: {_records.Count} muted, {_pending.Count} pending restore");
+            _boosted = state.Boosted;
+            if (_records.Count > 0 || _pending.Count > 0 || _boosted.Count > 0)
+                Logger.Info($"Loaded persisted state: {_records.Count} muted, {_pending.Count} pending restore, {_boosted.Count} boosted");
         }
         catch (Exception ex)
         {

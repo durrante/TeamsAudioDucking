@@ -16,6 +16,12 @@ public sealed class AppSettings
     /// <summary>Diagnostic: log audio session creations and periodic session snapshots.</summary>
     public bool TraceSessionEvents { get; set; }
 
+    /// <summary>Raise Teams' own session volume during calls (never the master volume).</summary>
+    public bool BoostTeamsVolume { get; set; }
+
+    /// <summary>Target Teams session volume during calls, percent. Only ever raised to this, never lowered.</summary>
+    public int TeamsCallVolumePercent { get; set; } = 80;
+
     /// <summary>Processes never muted (in addition to Teams itself). Names without .exe.</summary>
     public List<string> ExcludedProcesses { get; set; } = new();
 
