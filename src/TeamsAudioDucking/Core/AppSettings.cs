@@ -28,12 +28,18 @@ public sealed class AppSettings
     /// <summary>Processes always muted during calls, even if listed as excluded.</summary>
     public List<string> AlwaysMuteProcesses { get; set; } = new();
 
-    /// <summary>Process names treated as Microsoft Teams (never muted, used for call detection).</summary>
-    public List<string> TeamsProcessNames { get; set; } = new()
+    // MsTeamsVdi is the local media client Teams uses inside AVD/Windows 365
+    // sessions with media optimisation: it plays the call audio on this
+    // machine, so it must never be muted.
+    private static readonly string[] BuiltInTeamsProcessNames =
     {
         "ms-teams", "msteams", "teams",
         "microsoft.teams.slimcorevdihost", "microsoft.teams.slimcorevdihost.win-x64",
+        "msteamsvdi",
     };
+
+    /// <summary>Process names treated as Microsoft Teams (never muted, used for call detection).</summary>
+    public List<string> TeamsProcessNames { get; set; } = new(BuiltInTeamsProcessNames);
 
     [JsonIgnore]
     public static string DataDirectory { get; } = Path.Combine(
@@ -44,16 +50,24 @@ public sealed class AppSettings
 
     public static AppSettings Load()
     {
+        var settings = new AppSettings();
         try
         {
             if (File.Exists(SettingsPath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
+                settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath)) ?? new AppSettings();
         }
         catch (Exception ex)
         {
             Logger.Error("Failed to load settings, using defaults", ex);
         }
-        return new AppSettings();
+        // Settings saved by an older version keep working when a new Teams
+        // process becomes known: merge the built-ins back in.
+        foreach (var name in BuiltInTeamsProcessNames)
+        {
+            if (!settings.TeamsProcessNames.Any(t => Normalize(t) == Normalize(name)))
+                settings.TeamsProcessNames.Add(name);
+        }
+        return settings;
     }
 
     public void Save()

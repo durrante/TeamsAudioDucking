@@ -35,8 +35,9 @@ public sealed class TeamsCallDetector : IDisposable
 
     // Matches: packaged new Teams ("MSTeams_8wekyb3d8bbwe"), Teams' media
     // engine host ("Microsoft.Teams.SlimCoreVdiHost..."), non-packaged new
-    // Teams ("...#ms-teams.exe") and classic Teams ("...#Teams.exe").
-    private static readonly string[] RegistryTokens = { "msteams_", "slimcorevdihost", "ms-teams.exe", "teams.exe" };
+    // Teams ("...#ms-teams.exe"), classic Teams ("...#Teams.exe") and the
+    // local AVD media-optimisation client ("...#MsTeamsVdi.exe").
+    private static readonly string[] RegistryTokens = { "msteams_", "slimcorevdihost", "ms-teams.exe", "teams.exe", "msteamsvdi" };
 
     private const int EndDebounceMs = 2000;
     private const int RingSustainMs = 1500;

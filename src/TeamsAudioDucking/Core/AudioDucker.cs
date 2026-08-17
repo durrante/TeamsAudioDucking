@@ -140,7 +140,7 @@ public sealed class AudioDucker : IDisposable
             Logger.Info($"Muting other applications ({reason})");
             RefreshDevicesLocked();
             foreach (var holder in _devices.Values) MuteDeviceSessionsLocked(holder);
-            BoostTeamsSessionsLocked();
+            BoostTeamsSessionsLocked(logSkips: true);
             PersistLocked();
         }
         StateChanged?.Invoke();
@@ -201,8 +201,10 @@ public sealed class AudioDucker : IDisposable
         }
 
         // Teams is exempt no matter what - covers every Teams audio session,
-        // on any device, including ones created mid-call.
-        if (_settings.IsTeamsProcess(processName)) return;
+        // on any device, including ones created mid-call. Sessions owned by a
+        // Teams child process (the WebView2 host plays the incoming-call
+        // ringtone) count as Teams too.
+        if (IsTeamsSession(pid, processName)) return;
         if (isSystemSounds && !_settings.MuteSystemSounds) return;
         if (!_settings.IsAlwaysMuted(processName) && _settings.IsExcluded(processName)) return;
 
@@ -287,7 +289,7 @@ public sealed class AudioDucker : IDisposable
     /// applied once per session; if the user then drags Teams' slider down
     /// mid-call, that choice is respected (no re-assert).
     /// </summary>
-    private bool BoostTeamsSessionsLocked()
+    private bool BoostTeamsSessionsLocked(bool logSkips = false)
     {
         if (!_settings.BoostTeamsVolume) return false;
         bool changed = false;
@@ -297,9 +299,9 @@ public sealed class AudioDucker : IDisposable
             {
                 try
                 {
-                    var name = ResolveSessionProcessName(session, out bool isSystemSounds);
-                    if (isSystemSounds || name == null || !_settings.IsTeamsProcess(name)) continue;
-                    if (TryBoostSessionLocked(holder, session, name)) changed = true;
+                    var name = ResolveSessionProcessName(session, out bool isSystemSounds, out int pid);
+                    if (isSystemSounds || name == null || !IsTeamsSession(pid, name)) continue;
+                    if (TryBoostSessionLocked(holder, session, name, logSkips)) changed = true;
                 }
                 catch { }
             }
@@ -307,7 +309,7 @@ public sealed class AudioDucker : IDisposable
         return changed;
     }
 
-    private bool TryBoostSessionLocked(DeviceHolder holder, AudioSessionControl session, string processName)
+    private bool TryBoostSessionLocked(DeviceHolder holder, AudioSessionControl session, string processName, bool logSkip = false)
     {
         if (!_settings.BoostTeamsVolume) return false;
         try
@@ -321,7 +323,14 @@ public sealed class AudioDucker : IDisposable
 
             var volume = session.SimpleAudioVolume;
             float current = SafeVolume(volume);
-            if (current >= target) return false; // never lower Teams' volume
+            if (current >= target)
+            {
+                // Never lower Teams' volume. Log it once per call start so an
+                // "it didn't do anything" is explained rather than silent.
+                if (logSkip)
+                    Logger.Info($"Teams volume left alone: {processName} already at {(int)(current * 100)}% (target {(int)(target * 100)}%; only ever raised)");
+                return false;
+            }
 
             int pid = 0;
             try { pid = (int)session.GetProcessID; } catch { }
@@ -491,7 +500,7 @@ public sealed class AudioDucker : IDisposable
                     }
                     if (holder == null) return;
 
-                    var processName = ResolveSessionProcessName(session, out _);
+                    var processName = ResolveSessionProcessName(session, out _, out int pid);
                     if (_settings.TraceSessionEvents)
                         Logger.Info($"[trace] Session created: {processName ?? "<gone>"} on '{holder.Name}', state={SafeState(session)}");
 
@@ -499,7 +508,7 @@ public sealed class AudioDucker : IDisposable
                     // activity for ring detection. A session we see being
                     // created is trusted immediately (an outbound ring makes a
                     // fresh, already-active session).
-                    if (processName != null && _settings.IsTeamsProcess(processName))
+                    if (processName != null && IsTeamsSession(pid, processName))
                     {
                         RegisterTeamsSessionLocked(session, processName, trustInitialState: true);
                         if (_ducking)
@@ -624,9 +633,9 @@ public sealed class AudioDucker : IDisposable
                     if (session.State == AudioSessionState.AudioSessionStateExpired) continue;
                     string id = SafeInstanceId(session);
                     if (id.Length > 0 && _teamsSessions.ContainsKey(id)) continue;
-                    var processName = ResolveSessionProcessName(session, out bool isSystemSounds);
+                    var processName = ResolveSessionProcessName(session, out bool isSystemSounds, out int pid);
                     if (isSystemSounds || processName == null) continue;
-                    if (_settings.IsTeamsProcess(processName))
+                    if (IsTeamsSession(pid, processName))
                         RegisterTeamsSessionLocked(session, processName, trustInitialState: false);
                 }
                 catch { }
@@ -668,7 +677,7 @@ public sealed class AudioDucker : IDisposable
                 {
                     try
                     {
-                        var name = ResolveSessionProcessName(session, out bool sys) ?? "<gone>";
+                        var name = ResolveSessionProcessName(session, out bool sys, out _) ?? "<gone>";
                         Logger.Info($"[trace] '{holder.Name}': {(sys ? "System Sounds" : name)} state={SafeState(session)} muted={session.SimpleAudioVolume.Mute}");
                     }
                     catch { }
@@ -846,10 +855,18 @@ public sealed class AudioDucker : IDisposable
         }
     }
 
+    /// <summary>
+    /// True when the session's process is Teams itself, or a child of Teams
+    /// (WebView2 renders the incoming-call ringtone from a child process).
+    /// </summary>
+    private bool IsTeamsSession(int pid, string processName)
+        => _settings.IsTeamsProcess(processName) || ProcessAncestry.IsTeamsDescendant(pid, _settings);
+
     /// <summary>Process name for a session, or "System Sounds"; null if the process is gone.</summary>
-    private string? ResolveSessionProcessName(AudioSessionControl session, out bool isSystemSounds)
+    private string? ResolveSessionProcessName(AudioSessionControl session, out bool isSystemSounds, out int pid)
     {
         isSystemSounds = false;
+        pid = 0;
         try
         {
             if (session.IsSystemSoundsSession)
@@ -857,7 +874,7 @@ public sealed class AudioDucker : IDisposable
                 isSystemSounds = true;
                 return "System Sounds";
             }
-            int pid = (int)session.GetProcessID;
+            pid = (int)session.GetProcessID;
             if (pid == 0 || pid == _ownPid) return null;
             return GetProcessName(pid);
         }

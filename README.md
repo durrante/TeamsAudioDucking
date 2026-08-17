@@ -122,7 +122,10 @@ uses two Windows-level signals, both event-driven (no polling, near-zero CPU):
    instead (the per-app entries you see in the Volume Mixer). Teams' session
    staying active for 1.5s+ is the fingerprint of a ringtone or ringback
    tone, and starts the muting early. Short notification chimes flip back to
-   inactive well within that, so they are ignored.
+   inactive well within that, so they are ignored. Sessions belonging to
+   Teams' own child processes count too: new Teams plays the incoming-call
+   ringtone through its embedded WebView2 (`msedgewebview2.exe`), which is
+   recognised by walking the parent-process chain.
 
 To be clear: both signals are yes/no state flags that Windows already tracks.
 The utility never opens the microphone, never receives or analyses any audio
@@ -135,7 +138,7 @@ Worth knowing:
 | Mic test in Teams settings, recording a video clip in chat | Counts as a "call": other apps mute until you finish. |
 | Joining with **"Don't use audio"**, view-only webinars/live events | Teams never opens the mic, so nothing is detected or muted. |
 | Teams in the **browser** (teams.microsoft.com) | Not detected. Add your browser to the never-mute list if you use web Teams alongside the desktop app. |
-| Long Teams voice messages | Sustained Teams playback triggers muting until it stops (untick the ringing option if this bothers you). |
+| Long sounds played by Teams itself (voice messages, videos in chat) | Sustained Teams playback triggers muting until it stops (untick the ringing option if this bothers you). |
 | Windows privacy settings block Teams' mic access | Detection cannot work. |
 
 If ring detection does not fire on your machine, set
@@ -169,6 +172,13 @@ liable if it misbehaves.
 
 ## Changelog
 
+- **1.3.0**: incoming-call ring detection fixed: new Teams plays the incoming
+  ringtone through its WebView2 child process, which is now attributed to
+  Teams via the parent-process chain (and no longer muted during calls).
+  The AVD/Windows 365 media-optimisation client (`MsTeamsVdi.exe`) is now
+  recognised as Teams: its calls are detected and it is never muted. The
+  call-volume boost logs when Teams is already at or above the target, so a
+  no-op is visible in the log instead of silent.
 - **1.2.1**: settings window layout fix; README rework with icons and
   screenshots.
 - **1.2.0**: optional Teams call-volume boost: raise Teams' own session volume
