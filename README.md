@@ -1,224 +1,153 @@
+<!-- markdownlint-disable MD033 -->
 # Teams Audio Ducking
 
-A lightweight Windows 11 system-tray utility that automatically mutes every
-non-Teams application's audio while you are in a Microsoft Teams call or
-meeting, and restores each application to its exact previous state (mute flag
-and volume level) when the call ends.
+<img src="docs/images/app-icon.png" width="80" align="right" alt="Teams Audio Ducking icon: white speaker on a green circle"/>
 
-- No internet access, no telemetry, no Teams credentials, no audio recording.
-- No admin rights needed: per-user install, per-user startup, per-session audio control.
-- Event-driven; near-zero CPU when idle.
+A small Windows 11 system-tray utility that mutes everything *except*
+Microsoft Teams the moment a call starts (or even starts ringing), and puts
+every app back exactly as it was when the call ends.
 
-## How Teams call detection works (and its limits)
+Runs entirely locally: no internet access, no telemetry, no sign-in, nothing
+recorded. No admin rights needed.
 
-There is **no public local API** that exposes the new Teams client's call
-state. The most reliable Windows-level signal is:
+## The problem it fixes
 
-> Teams holds an open **microphone capture stream** for the entire duration of
-> a call or meeting, even while you are muted inside Teams (it keeps the
-> stream open so unmuting is instant).
+A Teams call comes in and something is making noise. Spotify, or a YouTube
+video buried in one of the 50 Chrome or Edge tabs you have open. Finding the
+right tab to mute while the call is ringing costs you a few valuable seconds,
+and you answer flustered or mute the whole PC (and with it, the call).
 
-Windows records per-app microphone usage under
-`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone`:
-while an app is actively using the mic, its `LastUsedTimeStop` value is `0`.
+Joining a meeting is the same worry in reverse: are you *sure* everything is
+quiet? A forgotten tab, or a paused video that autoplays, will pick the worst
+possible moment.
 
-This utility watches that key with `RegNotifyChangeKeyValue` (event-driven, no
-polling) and treats **"Teams is using the microphone AND a Teams process is
-running"** as *in a call*. Details:
+This utility removes the scramble:
 
-- Covers the new Teams client (`ms-teams.exe`, MSIX package `MSTeams_...`) and
-  classic Teams (`Teams.exe`, non-packaged), on any microphone device.
-- The process-liveness check ends the call state promptly if Teams crashes.
-- A 2-second debounce on "call ended" ignores the brief mic release that
-  happens when Teams switches audio devices mid-call.
-- A 5-second reconciliation sweep is a safety net for missed events (for
-  example around sleep/resume). It is a couple of registry reads when idle.
+- The moment a Teams call rings or connects, **every other app is muted**:
+  every tab, every player, on every audio device, including apps you open
+  mid-call.
+- When the call ends, **each app comes back exactly as it was**: an app that
+  was at 35% goes back to 35%, and an app you had muted before the call stays
+  muted.
+- Teams itself is never muted. Your microphone, master volume and default
+  device are never touched.
 
-### Ring detection (v1.1)
+## What you see
 
-The microphone signal only appears once a call is *connected*, so with the
-mic signal alone muting would start after you (or the other side) picks up,
-not while the call is ringing. To catch the ringing phase, the utility also
-watches Teams' own **playback** sessions via audio-session state events:
+It sits in the system tray:
 
-- Teams playing audio continuously for **1.5 seconds or more** (an outbound
-  ringback tone, or an incoming ring) starts the muting early. Short
-  notification chimes never last that long.
-- Once the call connects (mic in use), the mic signal alone decides when the
-  call ends, so the hang-up tone cannot delay the restore. A ring that is
-  never answered un-mutes as soon as the ringing stops (plus the usual
-  2-second debounce).
-- Sessions the utility merely *finds* (rather than sees being created) must go
-  quiet once before their activity counts, so a Teams session that idles in an
-  "active" state cannot fake a permanent call.
-- Side effect: any sustained Teams media playback (e.g. a long voice message)
-  also triggers muting until it stops. If that bothers you, untick *"Start
-  muting while a Teams call is ringing"* in Settings; call-connected detection
-  is unaffected.
-
-If ring detection does not fire on your machine, set `"TraceSessionEvents":
-true` in `settings.json` (see below), reproduce an outbound call, and check
-the log: it will record which process plays the ringback so the process list
-can be adjusted.
-
-### Known limitations
-
-| Scenario | Behaviour |
+| Icon | Meaning |
 | --- | --- |
-| Mic test in Teams settings, recording a video clip in chat | Detected as a "call" (mic in use). Other apps get muted until you finish. |
-| Joining a meeting with **"Don't use audio"** / view-only webinars & live events | Teams never opens the mic, so no call is detected and nothing is muted. |
-| Teams in a **browser** (teams.microsoft.com) | Not detected (the mic use belongs to the browser). The browser would also be muted during detected calls; add it to the exclusion list if you use web Teams alongside the desktop app. |
-| Windows privacy settings block Teams' microphone access | The signal never fires; detection cannot work. |
+| <img src="docs/images/icon-idle.png" width="24" alt="green icon"/> | Enabled, idle: watching for calls |
+| <img src="docs/images/icon-muting.png" width="24" alt="red icon with slash"/> | In a Teams call: other apps muted |
+| <img src="docs/images/icon-disabled.png" width="24" alt="grey icon"/> | Disabled |
 
-### Teams process/audio-session structure
+![Tray menu during a Teams call, showing call status and the number of muted applications](docs/images/screenshot-tray-menu.png)
+<!-- Screenshot to take: right-click the tray menu DURING a Teams call, so it
+     shows "In Teams call: yes" and "Muted N applications" with the red icon
+     visible in the tray. Crop tightly to the menu + tray corner. -->
 
-The new Teams client plays all call audio from `ms-teams.exe` and may create
-several simultaneous audio sessions (call audio, ringtones, notifications) on
-any render device. Some installs also carry the Teams media-engine host
-package (`Microsoft.Teams.SlimCoreVdiHost`), which can own the microphone
-stream instead of `ms-teams.exe`. All sessions belonging to `ms-teams` /
-`msteams` / `teams` / the SlimCore host are exempt from muting, on every
-device, including sessions created mid-call, so Teams can never be muted by
-this tool regardless of how it arranges its sessions.
+![The settings window](docs/images/screenshot-settings.png)
+<!-- Screenshot to take: the Settings window as it opens (default state is
+     fine). Whole window including title bar with the new icon. -->
 
-## What the muting does (and never does)
+Right-click for status, enable/disable, manual mute/restore, Settings and
+About (version info). Double-click opens Settings.
 
-Uses the Windows Core Audio session APIs (WASAPI, via the NAudio.Wasapi
-wrapper) to control **individual application audio sessions**:
+## Install
 
-- Enumerates all active render devices and their sessions; mutes every session
-  that is not Teams, not this utility, and not excluded (both *active* and
-  *inactive* sessions, so a paused Spotify cannot blast mid-call).
-- Records the exact prior state (mute flag + volume) per session before
-  touching it, and restores exactly that afterwards. Sessions that were
-  already muted are left completely untouched.
-- New audio sessions appearing during a call are muted immediately via
-  `IAudioSessionNotification` (session-created events).
-- Apps that restart during a call are re-muted, with their **original**
-  pre-call state carried over (Windows persists per-app mute, so this matters).
-- Apps closed while muted are restored the moment their session reappears
-  (state is kept for up to 24 hours).
-- Mute state is persisted to disk, so if the utility itself is killed
-  mid-call, the next start restores everything.
-- Optionally (off by default) raises **Teams' own** session volume to a
-  configurable level during calls, so the call is louder without touching the
-  master volume. It only ever *raises* Teams (never lowers it), applies once
-  per call (dragging the slider down mid-call is respected), and the prior
-  volume is restored exactly when the call ends.
+1. Download the latest `TeamsAudioDucking-Setup-x.y.z.exe` from
+   [Releases](https://github.com/durrante/TeamsAudioDucking/releases).
+2. Run it. No admin prompt: it installs for your user only and adds a
+   Start-menu shortcut, with an optional "start at sign-in" tick.
 
-Never touched: master volume, microphone, default playback device, device
-enable/disable state, Teams' own sessions.
+That's it. The tray icon appears and it starts watching for Teams calls.
 
-## Building
+Prefer no installer? Grab the portable zip from the same Releases page,
+unzip anywhere and run `TeamsAudioDucking.exe`. Startup-with-Windows is
+managed from within the app's Settings either way.
 
-Requirements: Windows, [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
-First build needs internet access for NuGet restore (single dependency: NAudio.Wasapi).
+### Upgrade
 
-```powershell
-# Self-contained single file (no runtime needed on the target machine):
-.\build.ps1
+Run the newer setup over the top. Your settings are kept (they live in
+`%LOCALAPPDATA%\TeamsAudioDucking`, outside the install folder). The
+installer closes the running copy and relaunches it afterwards.
 
-# Or a small framework-dependent build (target needs the .NET 8 Desktop Runtime):
-.\build.ps1 -FrameworkDependent
-```
+### Uninstall
 
-Output lands in `.\publish\TeamsAudioDucking.exe`.
+Windows Settings > Apps > Installed apps > Teams Audio Ducking > Uninstall
+(portable copy: exit it from the tray, untick "Start with Windows" first in
+Settings, and delete the folder). Settings and logs are deliberately left in
+`%LOCALAPPDATA%\TeamsAudioDucking`; delete that folder too for a clean slate.
 
-## Installing
+Building from source needs the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0):
+`.\build.ps1` then `.\installer\install.ps1`.
 
-Two options, both per-user and admin-free:
-
-### Option A: PowerShell script
-
-```powershell
-.\installer\install.ps1     # builds if needed, installs, adds Start-menu + startup, launches
-.\installer\uninstall.ps1   # removes everything (keeps settings/logs)
-```
-
-### Option B: Inno Setup installer
-
-```powershell
-.\build.ps1
-iscc installer\TeamsAudioDucking.iss   # needs Inno Setup 6
-```
-
-Produces `installer\Output\TeamsAudioDucking-Setup-1.2.0.exe` with a proper
-uninstaller, Start-menu shortcut and an optional "start at sign-in" task.
-
-Installs to `%LOCALAPPDATA%\Programs\TeamsAudioDucking`. Startup uses the
-per-user `HKCU\...\CurrentVersion\Run` key.
-
-## Using it
-
-It sits in the tray:
-
-- **Green** icon: enabled, idle.
-- **Red with a slash**: in a Teams call, other apps muted.
-- **Grey**: disabled.
-
-Right-click for status ("In Teams call", "Muted N applications"),
-enable/disable, manual mute/restore, Settings and Exit. Double-click opens
-Settings.
-
-Right-clicking also offers "About Teams Audio Ducking", which shows the
-version and data locations (the version is in the tray tooltip and at the
-bottom of the Settings window too).
-
-Settings (also editable as JSON, see below):
+## Settings
 
 - Enable/disable automatic muting
 - Start with Windows
-- Mute Windows system sounds too (off by default)
-- Start muting while a Teams call is ringing (on by default; see
-  *Ring detection* above)
-- Raise Teams' own volume during calls to a set percentage (off by default)
-- Exclusion list: processes never muted (one per line, e.g. `spotify`)
-- Always-mute list: processes muted during calls even if excluded
+- Also mute Windows system sounds (off by default)
+- Start muting while a Teams call is ringing (on by default)
+- Raise Teams' own volume during calls to a set percentage (off by default):
+  makes the call louder without touching the master volume; only ever raises
+  Teams, and its previous volume is restored after the call
+- Never-mute list: processes that are left alone (one per line, e.g. `spotify`)
+- Always-mute list: processes muted during calls even if listed above
 
-By default only Microsoft Teams is exempt.
+> "Restore audio now" during a call sticks until the next call: the utility
+> will not re-mute behind your back.
 
-JSON-only diagnostic option: `"TraceSessionEvents": true` logs every audio
-session creation, Teams playback transitions and a periodic session snapshot.
-Leave it off normally; it makes the log chatty.
+## How it knows you're in a call
 
-Note: "Restore audio now" during an active call sticks until the next call
-starts or ends; the utility will not re-mute behind your back.
+There is no public local API for the new Teams client's call state, so it
+uses two Windows-level signals, both event-driven (no polling, near-zero CPU):
 
-## Files
+1. **Microphone in use**: Teams holds the mic open for the whole call, even
+   while you are muted in Teams. Windows records this per-app in the registry,
+   which is watched for changes.
+2. **Ringing**: before a call connects there is no mic activity, so sustained
+   playback (1.5s+) from Teams' own audio session, the ringtone or ringback
+   tone, starts the muting early. Short notification chimes are ignored.
+
+Worth knowing:
+
+| Scenario | Behaviour |
+| --- | --- |
+| Mic test in Teams settings, recording a video clip in chat | Counts as a "call": other apps mute until you finish. |
+| Joining with **"Don't use audio"**, view-only webinars/live events | Teams never opens the mic, so nothing is detected or muted. |
+| Teams in the **browser** (teams.microsoft.com) | Not detected. Add your browser to the never-mute list if you use web Teams alongside the desktop app. |
+| Long Teams voice messages | Sustained Teams playback triggers muting until it stops (untick the ringing option if this bothers you). |
+| Windows privacy settings block Teams' mic access | Detection cannot work. |
+
+If ring detection does not fire on your machine, set
+`"TraceSessionEvents": true` in `settings.json`, make a short test call, and
+the log will show which process plays the ringback so the watch list can be
+extended.
+
+## Privacy
+
+Everything runs locally. The utility never connects to the internet, never
+reads call contents, audio or credentials, and never records anything. It
+only reads Windows' own "which app is using the microphone" registry key and
+controls per-app volume/mute through the Windows Core Audio API.
+
+## Files it keeps
 
 | Path | Purpose |
 | --- | --- |
 | `%LOCALAPPDATA%\TeamsAudioDucking\settings.json` | settings |
-| `%LOCALAPPDATA%\TeamsAudioDucking\muted-state.json` | crash-recovery mute state |
-| `%LOCALAPPDATA%\TeamsAudioDucking\logs\TeamsAudioDucking.log` | timestamped event log (calls detected/ended, apps muted/restored, errors; 2 MB rotation) |
-
-## Source layout
-
-```text
-src/TeamsAudioDucking/
-  App.xaml(.cs)              application wiring, timers, power/session events
-  Assets/app.ico             application icon (generated by tools/make-icon.ps1)
-  Core/TeamsCallDetector.cs  registry + playback-based Teams call detection
-  Core/AudioDucker.cs        WASAPI session mute/restore engine + Teams playback watch
-  Core/AppSettings.cs        JSON settings
-  Core/AppInfo.cs            assembly version helper
-  Core/StartupManager.cs     HKCU Run key management
-  Core/MuteRecord.cs         persisted per-session state
-  Core/Logger.cs             rotating file logger
-  Tray/TrayIcon.cs           tray icon + menu (icons drawn at runtime)
-  UI/SettingsWindow.xaml(.cs) settings window (WPF)
-installer/                   Inno Setup script + PowerShell install/uninstall
-tools/make-icon.ps1          regenerates Assets/app.ico
-build.ps1                    publish helper
-```
+| `%LOCALAPPDATA%\TeamsAudioDucking\muted-state.json` | crash-recovery state, so audio is restored even if the utility is killed mid-call |
+| `%LOCALAPPDATA%\TeamsAudioDucking\logs\TeamsAudioDucking.log` | event log (calls detected, apps muted/restored; 2 MB rotation) |
 
 ## Changelog
 
+- **1.2.1**: settings window layout fix; README rework with icons and
+  screenshots.
 - **1.2.0**: optional Teams call-volume boost: raise Teams' own session volume
   to a configurable percentage during calls, restored exactly afterwards
   (never the master volume, never lowered).
 - **1.1.0**: muting now starts while a call is ringing (Teams playback
   heuristic, can be disabled in Settings); About menu item with version in
-  the tray; proper application icon (window title bars, taskbar, Explorer);
-  `TraceSessionEvents` diagnostic setting.
+  the tray; proper application icon; `TraceSessionEvents` diagnostic setting.
 - **1.0.0**: initial release.

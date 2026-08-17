@@ -12,11 +12,12 @@
         <CheckBox x:Name="ChkStartup" Content="Start with Windows (current user, no admin needed)" Margin="0,2"/>
         <CheckBox x:Name="ChkSystemSounds" Content="Also mute Windows system sounds during calls" Margin="0,2"/>
         <CheckBox x:Name="ChkRinging" Content="Start muting while a Teams call is ringing (experimental)" Margin="0,2"/>
-        <StackPanel Orientation="Horizontal" Margin="0,2">
+        <StackPanel Orientation="Horizontal" Margin="0,2"
+                    ToolTip="Only ever raised, never lowered; Teams goes back to its previous volume when the call ends.">
             <CheckBox x:Name="ChkBoost" Content="Raise Teams' own volume during calls to" VerticalAlignment="Center"/>
             <TextBox x:Name="TxtBoostPercent" Width="36" Margin="6,0,2,0" MaxLength="3" VerticalAlignment="Center"
                      HorizontalContentAlignment="Center"/>
-            <TextBlock Text="% (only ever raised, never lowered)" VerticalAlignment="Center"/>
+            <TextBlock Text="%" VerticalAlignment="Center"/>
         </StackPanel>
 
         <TextBlock Text="Never mute these processes (one per line, e.g. spotify):" Margin="0,10,0,2"/>
