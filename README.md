@@ -10,6 +10,9 @@ every app back exactly as it was when the call ends.
 Runs entirely locally: no internet access, no telemetry, no sign-in, nothing
 recorded. No admin rights needed.
 
+📝 **Accompanying blog post**: [Mute Apps During Teams Calls Automatically](https://modernworkspacehub.com/mute-apps-during-teams-calls/)
+covers the story behind it and a walkthrough.
+
 ## The problem it fixes
 
 A Teams call comes in and something is making noise. Spotify, or a YouTube
