@@ -176,6 +176,12 @@ liable if it misbehaves.
 
 ## Changelog
 
+- **1.4.1**: fixes the call-volume option never actually working in the app
+  (the log showed "Could not raise the system volume: Specified cast is not
+  valid"). The audio device objects are created on the UI thread at startup,
+  and Windows will not let the system volume be reached through them from the
+  call detector's background thread, so the device is now looked up on
+  whichever thread is handling the call.
 - **1.4.0**: the call-volume option now raises the **system volume** of the
   device Teams plays through, instead of Teams' own app volume (app volume is
   usually already at 100%, so the old behaviour did nothing on most machines).

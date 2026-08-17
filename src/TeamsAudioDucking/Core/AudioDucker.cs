@@ -308,6 +308,23 @@ public sealed class AudioDucker : IDisposable
     /// Teams has no session at all there is no call audio to make louder yet,
     /// so the decision waits for one to appear).
     /// </summary>
+    /// <summary>
+    /// Runs <paramref name="work"/> against one device's system (endpoint) volume.
+    ///
+    /// The device is resolved fresh on the calling thread every time, deliberately.
+    /// The tracked MMDevice objects are created on the UI thread at startup, and
+    /// COM will not marshal them into the call detector's background thread:
+    /// activating the endpoint volume through one fails with E_NOINTERFACE. The
+    /// per-app session volume tolerates the crossing, endpoint volume does not.
+    /// This runs about twice per call, so the extra activation costs nothing.
+    /// </summary>
+    private static T WithEndpointVolume<T>(string deviceId, Func<AudioEndpointVolume, T> work)
+    {
+        using var enumerator = new MMDeviceEnumerator();
+        using var device = enumerator.GetDevice(deviceId);
+        return work(device.AudioEndpointVolume);
+    }
+
     private bool RaiseCallVolumeLocked(bool logSkip = false, bool force = false)
     {
         if (!_settings.BoostCallVolume) return false;
@@ -324,18 +341,23 @@ public sealed class AudioDucker : IDisposable
             if (existing != null && !force) continue;
             try
             {
-                var endpoint = holder.Device.AudioEndpointVolume;
-                float current = endpoint.MasterVolumeLevelScalar;
-                if (current >= target)
+                // An applied level of -1 means the device was already loud enough.
+                var (current, applied) = WithEndpointVolume<(float Current, float Applied)>(holder.Id, endpoint =>
+                {
+                    float level = endpoint.MasterVolumeLevelScalar;
+                    if (level >= target) return (level, -1f);
+                    endpoint.MasterVolumeLevelScalar = target;
+                    // Read back: Windows quantises the level to the device's own steps.
+                    return (level, endpoint.MasterVolumeLevelScalar);
+                });
+
+                if (applied < 0)
                 {
                     if (logSkip)
                         Logger.Info($"System volume left alone on '{holder.Name}': already at {(int)Math.Round(current * 100)}% (call level {(int)Math.Round(target * 100)}%; only ever raised)");
                     continue;
                 }
 
-                endpoint.MasterVolumeLevelScalar = target;
-                // Read back: Windows quantises the level to the device's own steps.
-                float applied = endpoint.MasterVolumeLevelScalar;
                 if (existing != null)
                 {
                     // Level raised in Settings mid-call: keep the original
@@ -435,43 +457,26 @@ public sealed class AudioDucker : IDisposable
 
         foreach (var record in _masterVolumes)
         {
-            MMDevice? device = null;
-            bool owned = false;
             try
             {
-                if (_devices.TryGetValue(record.DeviceId, out var holder))
+                // Non-null return means the level was changed by hand mid-call.
+                float? userLevel = WithEndpointVolume<float?>(record.DeviceId, endpoint =>
                 {
-                    device = holder.Device;
-                }
+                    float level = endpoint.MasterVolumeLevelScalar;
+                    if (Math.Abs(level - record.AppliedLevel) > Tolerance) return level;
+                    endpoint.MasterVolumeLevelScalar = record.PreviousLevel;
+                    return null;
+                });
+
+                if (userLevel.HasValue)
+                    Logger.Info($"System volume on '{record.DeviceName}' was changed during the call ({(int)Math.Round(userLevel.Value * 100)}%); leaving it alone");
                 else
-                {
-                    device = _enumerator?.GetDevice(record.DeviceId);
-                    owned = true; // not tracked: this wrapper is ours to dispose
-                }
-                if (device == null)
-                {
-                    Logger.Warn($"Output device '{record.DeviceName}' is gone; its system volume was left as it is");
-                    continue;
-                }
-
-                var endpoint = device.AudioEndpointVolume;
-                float current = endpoint.MasterVolumeLevelScalar;
-                if (Math.Abs(current - record.AppliedLevel) > Tolerance)
-                {
-                    Logger.Info($"System volume on '{record.DeviceName}' was changed during the call ({(int)Math.Round(current * 100)}%); leaving it alone");
-                    continue;
-                }
-
-                endpoint.MasterVolumeLevelScalar = record.PreviousLevel;
-                Logger.Info($"Restored system volume on '{record.DeviceName}' to {(int)Math.Round(record.PreviousLevel * 100)}%");
+                    Logger.Info($"Restored system volume on '{record.DeviceName}' to {(int)Math.Round(record.PreviousLevel * 100)}%");
             }
             catch (Exception ex)
             {
+                // Includes the device having been unplugged since the call started.
                 Logger.Warn($"Could not restore the system volume on '{record.DeviceName}': {ex.Message}");
-            }
-            finally
-            {
-                if (owned) { try { device?.Dispose(); } catch { } }
             }
         }
         _masterVolumes = new List<MasterVolumeRecord>();

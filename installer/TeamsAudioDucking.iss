@@ -3,7 +3,7 @@
 ; Then compile this script with Inno Setup 6: iscc installer\TeamsAudioDucking.iss
 
 #define MyAppName "Teams Audio Ducking"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.4.1"
 #define MyAppExeName "TeamsAudioDucking.exe"
 
 [Setup]
