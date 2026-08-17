@@ -111,11 +111,19 @@ There is no public local API for the new Teams client's call state, so it
 uses two Windows-level signals, both event-driven (no polling, near-zero CPU):
 
 1. **Microphone in use**: Teams holds the mic open for the whole call, even
-   while you are muted in Teams. Windows records this per-app in the registry,
-   which is watched for changes.
-2. **Ringing**: before a call connects there is no mic activity, so sustained
-   playback (1.5s+) from Teams' own audio session, the ringtone or ringback
-   tone, starts the muting early. Short notification chimes are ignored.
+   while you are muted in Teams. Windows records *which apps have the mic
+   open* in the registry (the same bookkeeping behind the taskbar mic icon),
+   and that key is watched for changes.
+2. **Ringing**: before a call connects there is no mic activity, so the
+   utility watches the active/inactive state of Teams' own audio sessions
+   instead (the per-app entries you see in the Volume Mixer). Teams' session
+   staying active for 1.5s+ is the fingerprint of a ringtone or ringback
+   tone, and starts the muting early. Short notification chimes flip back to
+   inactive well within that, so they are ignored.
+
+To be clear: both signals are yes/no state flags that Windows already tracks.
+The utility never opens the microphone, never receives or analyses any audio
+from either direction, and has nothing it could record even in principle.
 
 Worth knowing:
 
