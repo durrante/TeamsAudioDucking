@@ -16,11 +16,18 @@ public sealed class AppSettings
     /// <summary>Diagnostic: log audio session creations and periodic session snapshots.</summary>
     public bool TraceSessionEvents { get; set; }
 
-    /// <summary>Raise Teams' own session volume during calls (never the master volume).</summary>
-    public bool BoostTeamsVolume { get; set; }
+    // JSON names kept from 1.2.0 so existing settings files carry over. Up to
+    // 1.3.0 these raised Teams' own app volume; they now raise the system
+    // volume of the device Teams plays through, which is what actually makes a
+    // quiet call louder.
 
-    /// <summary>Target Teams session volume during calls, percent. Only ever raised to this, never lowered.</summary>
-    public int TeamsCallVolumePercent { get; set; } = 80;
+    /// <summary>Raise the system volume of Teams' output device during calls.</summary>
+    [JsonPropertyName("BoostTeamsVolume")]
+    public bool BoostCallVolume { get; set; }
+
+    /// <summary>Target system volume during calls, percent. Only ever raised to this, never lowered.</summary>
+    [JsonPropertyName("TeamsCallVolumePercent")]
+    public int CallVolumePercent { get; set; } = 80;
 
     /// <summary>Processes never muted (in addition to Teams itself). Names without .exe.</summary>
     public List<string> ExcludedProcesses { get; set; } = new();

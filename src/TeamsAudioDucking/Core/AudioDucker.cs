@@ -8,8 +8,11 @@ namespace TeamsAudioDucking.Core;
 
 /// <summary>
 /// Mutes and restores per-application audio sessions using the Windows Core
-/// Audio (WASAPI) session APIs. Never touches the master volume, the
-/// microphone, the default device or any Teams session.
+/// Audio (WASAPI) session APIs. Never touches the microphone, the default
+/// device or any Teams session. The system volume is left alone too, unless
+/// the call-volume option is switched on: then the output device Teams is
+/// playing through is raised for the duration of the call and put back
+/// afterwards.
 ///
 /// Event-driven: new sessions are caught via IAudioSessionNotification
 /// (OnSessionCreated) on every active render device, and device hot-plug via
@@ -73,7 +76,13 @@ public sealed class AudioDucker : IDisposable
     {
         public List<MuteRecord> Records { get; set; } = new();
         public List<MuteRecord> Pending { get; set; } = new();
+        /// <summary>
+        /// Teams app-volume boosts written by 1.2.0-1.3.0. Nothing adds to this
+        /// any more (the option raises the system volume instead), but records
+        /// left by an older version are still restored.
+        /// </summary>
         public List<MuteRecord> Boosted { get; set; } = new();
+        public List<MasterVolumeRecord> MasterVolumes { get; set; } = new();
     }
 
     private readonly AppSettings _settings;
@@ -82,7 +91,9 @@ public sealed class AudioDucker : IDisposable
     private readonly int _ownPid = Environment.ProcessId;
     private List<MuteRecord> _records = new();   // sessions we muted, awaiting restore
     private List<MuteRecord> _pending = new();   // sessions that vanished while muted; restore when they reappear
-    private List<MuteRecord> _boosted = new();   // Teams sessions whose volume we raised for the call
+    private List<MuteRecord> _boosted = new();   // legacy Teams app-volume boosts (1.2.0-1.3.0), restore only
+    private List<MasterVolumeRecord> _masterVolumes = new(); // output devices raised for the call
+    private bool _callVolumeDecided;             // the call-volume decision has been made for this call
     private readonly Dictionary<string, TeamsSessionEntry> _teamsSessions = new();
     private MMDeviceEnumerator? _enumerator;
     private EndpointNotificationClient? _notificationClient;
@@ -106,7 +117,10 @@ public sealed class AudioDucker : IDisposable
 
     public bool IsDucking { get { lock (_lock) return _ducking; } }
     public int MutedCount { get { lock (_lock) return _records.Count; } }
-    public bool HasLeftoverRecords { get { lock (_lock) return _records.Count > 0 || _boosted.Count > 0; } }
+    public bool HasLeftoverRecords
+    {
+        get { lock (_lock) return _records.Count > 0 || _boosted.Count > 0 || _masterVolumes.Count > 0; }
+    }
 
     public AudioDucker(AppSettings settings) => _settings = settings;
 
@@ -140,7 +154,7 @@ public sealed class AudioDucker : IDisposable
             Logger.Info($"Muting other applications ({reason})");
             RefreshDevicesLocked();
             foreach (var holder in _devices.Values) MuteDeviceSessionsLocked(holder);
-            BoostTeamsSessionsLocked(logSkips: true);
+            RaiseCallVolumeLocked(logSkip: true);
             PersistLocked();
         }
         StateChanged?.Invoke();
@@ -159,8 +173,8 @@ public sealed class AudioDucker : IDisposable
             int before = _records.Count;
             RefreshDevicesLocked();
             foreach (var holder in _devices.Values) MuteDeviceSessionsLocked(holder);
-            bool boostChanged = BoostTeamsSessionsLocked();
-            changed = _records.Count != before || boostChanged;
+            bool volumeChanged = RaiseCallVolumeLocked();
+            changed = _records.Count != before || volumeChanged;
             if (changed) PersistLocked();
         }
         if (changed) StateChanged?.Invoke();
@@ -281,81 +295,187 @@ public sealed class AudioDucker : IDisposable
         Logger.Info($"Muted: {processName} (volume was {(int)(record.PreviousVolume * 100)}%, device '{holder.Name}')");
     }
 
-    // ------------------------------------------------- Teams volume boost
+    // --------------------------------------------------- call volume (system)
 
     /// <summary>
-    /// Raises every Teams session sitting below the configured call volume to
-    /// that level, recording the prior volume for exact restore. Boost is
-    /// applied once per session; if the user then drags Teams' slider down
-    /// mid-call, that choice is respected (no re-assert).
+    /// Raises the system volume of the output device Teams is playing through
+    /// to the configured call level, recording the previous level for exact
+    /// restore. Only ever raises, never lowers. Applied once per call: if the
+    /// volume is then changed by hand mid-call, that choice stands.
+    ///
+    /// The device is taken from Teams' own audio sessions rather than from the
+    /// default device, because Teams may well be playing somewhere else (and if
+    /// Teams has no session at all there is no call audio to make louder yet,
+    /// so the decision waits for one to appear).
     /// </summary>
-    private bool BoostTeamsSessionsLocked(bool logSkips = false)
+    private bool RaiseCallVolumeLocked(bool logSkip = false, bool force = false)
     {
-        if (!_settings.BoostTeamsVolume) return false;
+        if (!_settings.BoostCallVolume) return false;
+        if (_callVolumeDecided && !force) return false;
+
+        var holders = FindTeamsPlaybackDevicesLocked();
+        if (holders.Count == 0) return false; // Teams not playing yet; try again later
+
+        float target = Math.Clamp(_settings.CallVolumePercent, 1, 100) / 100f;
         bool changed = false;
+        foreach (var holder in holders)
+        {
+            var existing = _masterVolumes.FirstOrDefault(r => r.DeviceId == holder.Id);
+            if (existing != null && !force) continue;
+            try
+            {
+                var endpoint = holder.Device.AudioEndpointVolume;
+                float current = endpoint.MasterVolumeLevelScalar;
+                if (current >= target)
+                {
+                    if (logSkip)
+                        Logger.Info($"System volume left alone on '{holder.Name}': already at {(int)Math.Round(current * 100)}% (call level {(int)Math.Round(target * 100)}%; only ever raised)");
+                    continue;
+                }
+
+                endpoint.MasterVolumeLevelScalar = target;
+                // Read back: Windows quantises the level to the device's own steps.
+                float applied = endpoint.MasterVolumeLevelScalar;
+                if (existing != null)
+                {
+                    // Level raised in Settings mid-call: keep the original
+                    // pre-call level so the restore is still correct.
+                    existing.AppliedLevel = applied;
+                }
+                else
+                {
+                    _masterVolumes.Add(new MasterVolumeRecord
+                    {
+                        DeviceId = holder.Id,
+                        DeviceName = holder.Name,
+                        PreviousLevel = current,
+                        AppliedLevel = applied,
+                        RaisedAtUtc = DateTime.UtcNow,
+                    });
+                }
+                changed = true;
+                Logger.Info($"Raised system volume on '{holder.Name}': {(int)Math.Round(current * 100)}% -> {(int)Math.Round(applied * 100)}%");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Could not raise the system volume on '{holder.Name}': {ex.Message}");
+            }
+        }
+
+        _callVolumeDecided = true;
+        return changed;
+    }
+
+    /// <summary>
+    /// Devices that currently have a Teams audio session, preferring those
+    /// where a Teams session is actively playing (the ringtone or the call).
+    /// </summary>
+    private List<DeviceHolder> FindTeamsPlaybackDevicesLocked()
+    {
+        var active = new List<DeviceHolder>();
+        var any = new List<DeviceHolder>();
         foreach (var holder in _devices.Values)
         {
+            bool hasTeams = false, hasActiveTeams = false;
             foreach (var session in GetSessionsLocked(holder))
             {
                 try
                 {
+                    if (session.State == AudioSessionState.AudioSessionStateExpired) continue;
                     var name = ResolveSessionProcessName(session, out bool isSystemSounds, out int pid);
                     if (isSystemSounds || name == null || !IsTeamsSession(pid, name)) continue;
-                    if (TryBoostSessionLocked(holder, session, name, logSkips)) changed = true;
+                    hasTeams = true;
+                    if (session.State == AudioSessionState.AudioSessionStateActive) hasActiveTeams = true;
                 }
                 catch { }
             }
+            if (hasActiveTeams) active.Add(holder);
+            if (hasTeams) any.Add(holder);
         }
-        return changed;
+        return active.Count > 0 ? active : any;
     }
 
-    private bool TryBoostSessionLocked(DeviceHolder holder, AudioSessionControl session, string processName, bool logSkip = false)
+    /// <summary>
+    /// Called after a settings change during a call: applies a newly enabled
+    /// option or a raised call level straight away, and puts the volume back
+    /// immediately if the option has just been switched off.
+    /// </summary>
+    public void ReapplyCallVolume()
     {
-        if (!_settings.BoostTeamsVolume) return false;
-        try
+        bool changed;
+        lock (_lock)
         {
-            if (session.State == AudioSessionState.AudioSessionStateExpired) return false;
-            float target = Math.Clamp(_settings.TeamsCallVolumePercent, 1, 100) / 100f;
-
-            string instanceId = SafeInstanceId(session);
-            if (instanceId.Length > 0 && _boosted.Any(r => r.SessionInstanceId == instanceId))
-                return false; // already boosted this call
-
-            var volume = session.SimpleAudioVolume;
-            float current = SafeVolume(volume);
-            if (current >= target)
+            if (_disposed || !_ducking) return;
+            if (!_settings.BoostCallVolume)
             {
-                // Never lower Teams' volume. Log it once per call start so an
-                // "it didn't do anything" is explained rather than silent.
-                if (logSkip)
-                    Logger.Info($"Teams volume left alone: {processName} already at {(int)(current * 100)}% (target {(int)(target * 100)}%; only ever raised)");
-                return false;
+                if (_masterVolumes.Count == 0) return;
+                Logger.Info("Call volume option switched off; putting the system volume back");
+                RestoreCallVolumeLocked();
+                changed = true;
             }
-
-            int pid = 0;
-            try { pid = (int)session.GetProcessID; } catch { }
-
-            volume.Volume = target;
-            _boosted.Add(new MuteRecord
+            else
             {
-                DeviceId = holder.Id,
-                SessionInstanceId = instanceId,
-                Pid = pid,
-                ProcessName = processName,
-                IsSystemSounds = false,
-                WasMuted = false,
-                PreviousVolume = current,
-                VolumeOnly = true,
-                MutedAtUtc = DateTime.UtcNow,
-            });
-            Logger.Info($"Raised Teams volume: {processName} {(int)(current * 100)}% -> {(int)(target * 100)}% (device '{holder.Name}')");
-            return true;
+                changed = RaiseCallVolumeLocked(logSkip: true, force: true);
+            }
+            if (changed) PersistLocked();
         }
-        catch (Exception ex)
+        if (changed) StateChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Puts every raised device back to its pre-call level, unless the level
+    /// has been changed by hand since (then the user's choice is kept).
+    /// </summary>
+    private void RestoreCallVolumeLocked()
+    {
+        // Levels round-trip exactly; this only absorbs float noise. It must stay
+        // well under one volume step (2%) so a single nudge of the slider counts
+        // as the user taking over.
+        const float Tolerance = 0.005f;
+
+        foreach (var record in _masterVolumes)
         {
-            Logger.Warn($"Could not raise Teams volume ({processName}): {ex.Message}");
-            return false;
+            MMDevice? device = null;
+            bool owned = false;
+            try
+            {
+                if (_devices.TryGetValue(record.DeviceId, out var holder))
+                {
+                    device = holder.Device;
+                }
+                else
+                {
+                    device = _enumerator?.GetDevice(record.DeviceId);
+                    owned = true; // not tracked: this wrapper is ours to dispose
+                }
+                if (device == null)
+                {
+                    Logger.Warn($"Output device '{record.DeviceName}' is gone; its system volume was left as it is");
+                    continue;
+                }
+
+                var endpoint = device.AudioEndpointVolume;
+                float current = endpoint.MasterVolumeLevelScalar;
+                if (Math.Abs(current - record.AppliedLevel) > Tolerance)
+                {
+                    Logger.Info($"System volume on '{record.DeviceName}' was changed during the call ({(int)Math.Round(current * 100)}%); leaving it alone");
+                    continue;
+                }
+
+                endpoint.MasterVolumeLevelScalar = record.PreviousLevel;
+                Logger.Info($"Restored system volume on '{record.DeviceName}' to {(int)Math.Round(record.PreviousLevel * 100)}%");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Could not restore the system volume on '{record.DeviceName}': {ex.Message}");
+            }
+            finally
+            {
+                if (owned) { try { device?.Dispose(); } catch { } }
+            }
         }
+        _masterVolumes = new List<MasterVolumeRecord>();
+        _callVolumeDecided = false;
     }
 
     // --------------------------------------------------------------- restore
@@ -366,8 +486,9 @@ public sealed class AudioDucker : IDisposable
         {
             if (_disposed) return;
             _ducking = false;
-            if (_records.Count == 0 && _boosted.Count == 0)
+            if (_records.Count == 0 && _boosted.Count == 0 && _masterVolumes.Count == 0)
             {
+                _callVolumeDecided = false;
                 PersistLocked();
                 Logger.Info($"Restore requested ({reason}); nothing to restore");
             }
@@ -375,6 +496,7 @@ public sealed class AudioDucker : IDisposable
             {
                 Logger.Info($"Restoring application audio ({reason})");
                 RefreshDevicesLocked();
+                RestoreCallVolumeLocked();
 
                 var sessionsByDevice = new Dictionary<string, List<AudioSessionControl>>();
                 foreach (var holder in _devices.Values)
@@ -513,7 +635,8 @@ public sealed class AudioDucker : IDisposable
                         RegisterTeamsSessionLocked(session, processName, trustInitialState: true);
                         if (_ducking)
                         {
-                            if (TryBoostSessionLocked(holder, session, processName)) PersistLocked();
+                            // Teams has just revealed which device it plays on.
+                            if (RaiseCallVolumeLocked()) PersistLocked();
                         }
                         else
                         {
@@ -938,7 +1061,13 @@ public sealed class AudioDucker : IDisposable
         try
         {
             Directory.CreateDirectory(AppSettings.DataDirectory);
-            var state = new PersistedState { Records = _records, Pending = _pending, Boosted = _boosted };
+            var state = new PersistedState
+            {
+                Records = _records,
+                Pending = _pending,
+                Boosted = _boosted,
+                MasterVolumes = _masterVolumes,
+            };
             File.WriteAllText(StatePath, JsonSerializer.Serialize(state, JsonOpts));
         }
         catch (Exception ex)
@@ -957,8 +1086,13 @@ public sealed class AudioDucker : IDisposable
             _records = state.Records;
             _pending = state.Pending;
             _boosted = state.Boosted;
-            if (_records.Count > 0 || _pending.Count > 0 || _boosted.Count > 0)
-                Logger.Info($"Loaded persisted state: {_records.Count} muted, {_pending.Count} pending restore, {_boosted.Count} boosted");
+            _masterVolumes = state.MasterVolumes;
+            // A raised device loaded from disk means the previous run was killed
+            // mid-call; the decision for that call has already been made.
+            _callVolumeDecided = _masterVolumes.Count > 0;
+            if (_records.Count > 0 || _pending.Count > 0 || _boosted.Count > 0 || _masterVolumes.Count > 0)
+                Logger.Info($"Loaded persisted state: {_records.Count} muted, {_pending.Count} pending restore, " +
+                            $"{_boosted.Count} app volume(s) raised, {_masterVolumes.Count} device volume(s) raised");
         }
         catch (Exception ex)
         {

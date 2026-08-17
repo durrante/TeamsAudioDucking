@@ -32,8 +32,9 @@ This utility removes the scramble:
 - When the call ends, **each app comes back exactly as it was**: an app that
   was at 35% goes back to 35%, and an app you had muted before the call stays
   muted.
-- Teams itself is never muted. Your microphone, master volume and default
-  device are never touched.
+- Teams itself is never muted. Your microphone and default device are never
+  touched, and the Windows volume is left alone unless you switch on the
+  optional call volume below.
 
 ## What you see
 
@@ -99,9 +100,12 @@ Building from source needs the [.NET 8 SDK](https://dotnet.microsoft.com/downloa
 - Start with Windows
 - Also mute Windows system sounds (off by default)
 - Start muting while a Teams call is ringing (on by default)
-- Raise Teams' own volume during calls to a set percentage (off by default):
-  makes the call louder without touching the master volume; only ever raises
-  Teams, and its previous volume is restored after the call
+- Raise the system volume during calls to a set percentage (off by default):
+  for when Windows is turned down and a call arrives. It raises the Windows
+  volume of the output device Teams is actually playing through (not
+  necessarily your default device), it only ever raises it, and the previous
+  level is put back when the call ends. Adjust the volume yourself during the
+  call and your level is kept instead
 - Never-mute list: processes that are left alone (one per line, e.g. `spotify`)
 - Always-mute list: processes muted during calls even if listed above
 
@@ -172,6 +176,10 @@ liable if it misbehaves.
 
 ## Changelog
 
+- **1.4.0**: the call-volume option now raises the **system volume** of the
+  device Teams plays through, instead of Teams' own app volume (app volume is
+  usually already at 100%, so the old behaviour did nothing on most machines).
+  Restored exactly after the call, unless you adjusted it yourself mid-call.
 - **1.3.0**: incoming-call ring detection fixed: new Teams plays the incoming
   ringtone through its WebView2 child process, which is now attributed to
   Teams via the parent-process chain (and no longer muted during calls).

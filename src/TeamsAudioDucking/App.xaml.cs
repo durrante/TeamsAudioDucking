@@ -103,8 +103,12 @@ public partial class App : System.Windows.Application
         if (_settings.StartWithWindows != StartupManager.IsEnabled())
             StartupManager.SetEnabled(_settings.StartWithWindows);
         ApplyEnabledState();
-        // Newly enabled boost (or a raised level) takes effect mid-call.
-        if (_settings.Enabled && _ducker.IsDucking) _ducker.EnsureDucked();
+        // Newly enabled call volume (or a changed level) takes effect mid-call.
+        if (_settings.Enabled && _ducker.IsDucking)
+        {
+            _ducker.EnsureDucked();
+            _ducker.ReapplyCallVolume();
+        }
     }
 
     private void ApplyEnabledState()
