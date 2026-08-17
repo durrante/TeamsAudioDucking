@@ -3,3 +3,4 @@ obj/
 publish/
 installer/Output/
 *.user
+blog-draft*.md
