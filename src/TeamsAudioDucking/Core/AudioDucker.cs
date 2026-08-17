@@ -98,9 +98,37 @@ public sealed class AudioDucker : IDisposable
     private MMDeviceEnumerator? _enumerator;
     private EndpointNotificationClient? _notificationClient;
     private System.Threading.Timer? _deviceRefreshTimer;
-    private bool _teamsPlaybackActive;
+    private bool _teamsSessionsActive;           // a Teams session is in the Active state
+    private bool _teamsPlaybackActive;           // Teams is actually making a sustained sound
     private bool _ducking;
     private bool _disposed;
+
+    // Ring detection. A Teams session being "Active" does not mean Teams is
+    // making any noise: new Teams plays both its ringtone and its chat pings
+    // through its WebView2 child, and Chromium holds the render stream open for
+    // seconds after a sound has finished. Session state alone therefore counts
+    // every notification as a ring.
+    //
+    // The peak meter separates them. Measured here: Teams' notification chime
+    // (a8_teams_basic_notification_r4_ping.wav) is 0.84s long but only audible
+    // for ~0.35s, its tail decaying below 0.015; a ringtone keeps sounding until
+    // the call is answered or missed. So "ringing" means a sustained amount of
+    // real sound rather than a session flag: enough sound must pile up inside a
+    // rolling window.
+    //
+    // The window is deliberately generous. It takes six chat pings inside eight
+    // seconds to fake, while a ringtone as sparse as 30% sound passes it, and
+    // the cost of being slow is small: the ring signal only has to beat the
+    // answer, and the microphone signal takes over the moment the call connects.
+    private const float AudibleThreshold = 0.02f;
+    private const int MeterIntervalMs = 200;
+    private const int AudibleWindowMs = 8000;   // rolling window inspected
+    private const int AudibleNeededMs = 2400;   // audible time within it to count as ringing
+    private const int AudibleSilenceMs = 3000;  // quiet for this long ends the episode
+
+    private System.Threading.Timer? _meterTimer;
+    private readonly Queue<(DateTime At, bool Audible)> _meterSamples = new();
+    private DateTime _lastAudibleUtc = DateTime.MinValue;
 
     private static string StatePath => Path.Combine(AppSettings.DataDirectory, "muted-state.json");
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = true };
@@ -727,14 +755,98 @@ public sealed class AudioDucker : IDisposable
         if (playbackChanged) TeamsPlaybackChanged?.Invoke(playbackNow);
     }
 
+    /// <summary>
+    /// Reacts to Teams sessions becoming active or inactive. An active session
+    /// only means Teams *might* be making a sound, so it starts the meter
+    /// sampling that decides; no active session at all is conclusive.
+    /// </summary>
     private bool RecomputeTeamsPlaybackLocked()
     {
-        bool active = _teamsSessions.Values.Any(e => e.Calibrated && e.Active);
-        if (active == _teamsPlaybackActive) return false;
-        _teamsPlaybackActive = active;
+        bool sessionsActive = _teamsSessions.Values.Any(e => e.Calibrated && e.Active);
+        if (sessionsActive != _teamsSessionsActive)
+        {
+            _teamsSessionsActive = sessionsActive;
+            if (sessionsActive) StartMeterSamplingLocked();
+            else StopMeterSamplingLocked();
+        }
+        // While sessions are active the sampler decides; silence ends it.
+        return sessionsActive ? false : SetTeamsPlaybackLocked(false);
+    }
+
+    private bool SetTeamsPlaybackLocked(bool playing)
+    {
+        if (playing == _teamsPlaybackActive) return false;
+        _teamsPlaybackActive = playing;
         if (_settings.TraceSessionEvents)
-            Logger.Info($"[trace] Teams playback -> {(active ? "active" : "inactive")}");
+            Logger.Info($"[trace] Teams playback -> {(playing ? "audible" : "quiet")}");
         return true;
+    }
+
+    private void StartMeterSamplingLocked()
+    {
+        if (_meterTimer != null) return;
+        _meterSamples.Clear();
+        _lastAudibleUtc = DateTime.MinValue;
+        _meterTimer = new System.Threading.Timer(_ => MeterTick(), null, MeterIntervalMs, MeterIntervalMs);
+    }
+
+    private void StopMeterSamplingLocked()
+    {
+        _meterTimer?.Dispose();
+        _meterTimer = null;
+        _meterSamples.Clear();
+        _lastAudibleUtc = DateTime.MinValue;
+    }
+
+    /// <summary>
+    /// Samples how loud Teams' own sessions actually are. Runs at 5Hz, and only
+    /// while a Teams session is active, so an idle machine does no work.
+    /// </summary>
+    private void MeterTick()
+    {
+        bool changed, playing;
+        lock (_lock)
+        {
+            if (_disposed || _meterTimer == null) return;
+
+            float peak = 0f;
+            foreach (var entry in _teamsSessions.Values)
+            {
+                if (!entry.Calibrated || !entry.Active) continue;
+                // A level, not audio: the same number the Volume Mixer's bar shows.
+                try { peak = Math.Max(peak, entry.Control.AudioMeterInformation.MasterPeakValue); }
+                catch { }
+            }
+            changed = RecordMeterSampleLocked(peak);
+            playing = _teamsPlaybackActive;
+        }
+        if (changed) TeamsPlaybackChanged?.Invoke(playing);
+    }
+
+    private bool RecordMeterSampleLocked(float peak)
+    {
+        var now = DateTime.UtcNow;
+        bool audible = peak >= AudibleThreshold;
+        if (audible) _lastAudibleUtc = now;
+
+        _meterSamples.Enqueue((now, audible));
+        while (_meterSamples.Count > 0 && (now - _meterSamples.Peek().At).TotalMilliseconds > AudibleWindowMs)
+            _meterSamples.Dequeue();
+
+        if (!_teamsPlaybackActive)
+        {
+            int audibleMs = _meterSamples.Count(s => s.Audible) * MeterIntervalMs;
+            if (audibleMs < AudibleNeededMs) return false;
+            if (_settings.TraceSessionEvents)
+                Logger.Info($"[trace] Teams audible for {audibleMs}ms of the last {AudibleWindowMs}ms (peak {peak:F3})");
+            return SetTeamsPlaybackLocked(true);
+        }
+
+        // Already counted as playing: hold it until Teams goes quiet, so gaps
+        // between rings do not end the call early.
+        if (_lastAudibleUtc != DateTime.MinValue && (now - _lastAudibleUtc).TotalMilliseconds >= AudibleSilenceMs)
+            return SetTeamsPlaybackLocked(false);
+        return false;
     }
 
     /// <summary>
@@ -1119,6 +1231,7 @@ public sealed class AudioDucker : IDisposable
             if (_disposed) return;
             _disposed = true;
             _deviceRefreshTimer?.Dispose();
+            StopMeterSamplingLocked();
             foreach (var (_, entry) in _teamsSessions.ToList())
             {
                 try { entry.Control.UnRegisterEventClient(entry.Handler); } catch { }

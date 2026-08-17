@@ -115,25 +115,29 @@ Building from source needs the [.NET 8 SDK](https://dotnet.microsoft.com/downloa
 ## How it knows you're in a call
 
 There is no public local API for the new Teams client's call state, so it
-uses two Windows-level signals, both event-driven (no polling, near-zero CPU):
+uses two Windows-level signals:
 
 1. **Microphone in use**: Teams holds the mic open for the whole call, even
    while you are muted in Teams. Windows records *which apps have the mic
    open* in the registry (the same bookkeeping behind the taskbar mic icon),
-   and that key is watched for changes.
+   and that key is watched for changes. Event-driven, no polling.
 2. **Ringing**: before a call connects there is no mic activity, so the
-   utility watches the active/inactive state of Teams' own audio sessions
-   instead (the per-app entries you see in the Volume Mixer). Teams' session
-   staying active for 1.5s+ is the fingerprint of a ringtone or ringback
-   tone, and starts the muting early. Short notification chimes flip back to
-   inactive well within that, so they are ignored. Sessions belonging to
-   Teams' own child processes count too: new Teams plays the incoming-call
-   ringtone through its embedded WebView2 (`msedgewebview2.exe`), which is
-   recognised by walking the parent-process chain.
+   utility looks at how loud Teams' own audio sessions are instead: the
+   number behind the moving bar in the Volume Mixer, read five times a second
+   while a Teams session is open (and not at all when it is closed). A
+   ringtone keeps sounding until you answer, so muting starts about 2.5
+   seconds in. A chat ping is audible for about a third of a second, so it
+   never adds up to a ring: you would need six pings inside eight seconds to
+   fool it. Sessions belonging to Teams' own child processes count too: new
+   Teams plays both the incoming-call ringtone and your notification sounds
+   through its embedded WebView2 (`msedgewebview2.exe`), which is recognised
+   by walking the parent-process chain.
 
-To be clear: both signals are yes/no state flags that Windows already tracks.
-The utility never opens the microphone, never receives or analyses any audio
-from either direction, and has nothing it could record even in principle.
+To be clear: the first signal is a yes/no flag Windows already tracks, and
+the second is a loudness level, the same one the Volume Mixer draws. Neither
+is audio. The utility never opens the microphone, never receives or analyses
+any audio from either direction, and has nothing it could record even in
+principle.
 
 Worth knowing:
 
@@ -142,6 +146,7 @@ Worth knowing:
 | Mic test in Teams settings, recording a video clip in chat | Counts as a "call": other apps mute until you finish. |
 | Joining with **"Don't use audio"**, view-only webinars/live events | Teams never opens the mic, so nothing is detected or muted. |
 | Teams in the **browser** (teams.microsoft.com) | Not detected. Add your browser to the never-mute list if you use web Teams alongside the desktop app. |
+| Chat pings and other Teams notification sounds | Too short to count as ringing, so nothing is muted. |
 | Long sounds played by Teams itself (voice messages, videos in chat) | Sustained Teams playback triggers muting until it stops (untick the ringing option if this bothers you). |
 | Windows privacy settings block Teams' mic access | Detection cannot work. |
 
@@ -154,8 +159,10 @@ extended.
 
 Everything runs locally. The utility never connects to the internet, never
 reads call contents, audio or credentials, and never records anything. It
-only reads Windows' own "which app is using the microphone" registry key and
-controls per-app volume/mute through the Windows Core Audio API.
+reads Windows' own "which app is using the microphone" registry key, reads
+the peak level of Teams' own playback (a single number per session, never the
+audio itself, and never from the microphone), and controls per-app volume and
+mute through the Windows Core Audio API.
 
 ## Licence
 
@@ -176,6 +183,14 @@ liable if it misbehaves.
 
 ## Changelog
 
+- **1.4.2**: chat messages and other Teams notifications no longer mute your
+  other apps. New Teams plays its pings through the same WebView2 child as
+  its ringtone, and Chromium keeps that audio session open (and looking
+  "active") for seconds after a sound has finished, so a ping looked exactly
+  like a ring. Ring detection now measures how loud Teams actually is rather
+  than whether its session is open: it takes roughly 2.5 seconds of real
+  sound within an eight-second window, which a ringtone passes and a chat
+  ping cannot.
 - **1.4.1**: fixes the call-volume option never actually working in the app
   (the log showed "Could not raise the system volume: Specified cast is not
   valid"). The audio device objects are created on the UI thread at startup,
